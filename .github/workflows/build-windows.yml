@@ -1,0 +1,45 @@
+name: "Build Windows (MSVC)"
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Setup Rust (MSVC target is default on windows-latest)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Tauri app (MSVC + NSIS installer)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: "./src-tauri"
+          args: --target x86_64-pc-windows-msvc
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: medgrapher-windows-msvc
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/medgrapher.exe
+

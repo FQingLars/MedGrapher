@@ -42,6 +42,8 @@
       notifyEnabled = savedNotify;
     }
 
+    await loadTables();
+
     storeReady = true;
   });
 
@@ -106,6 +108,15 @@
     "шкала оценки двигательных функций",
   ];
 
+  // Данные из CSV-таблиц (Процедуры.csv / ЛФК.csv) для сносок
+  interface ProcInfo {
+    equipment: string;
+    parameters: string;
+  }
+
+  let proceduresMap = $state<Record<string, ProcInfo>>({});
+  let lfkMap = $state<Record<string, string>>({});
+
   let renderedHtml = $derived(rawMarkdown ? marked(rawMarkdown) : "");
 
   function toggleVisibleScale(s: string) {
@@ -114,6 +125,123 @@
     } else {
       visibleScales = [...visibleScales, s];
     }
+  }
+
+  // --- Парсинг CSV (Процедуры.csv / ЛФК.csv) ---
+  function parseCsvLine(line: string): string[] {
+    const out: string[] = [];
+    let cur = "";
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === String.fromCharCode(34)) {
+        if (inQuotes && line[i + 1] === String.fromCharCode(34)) {
+          cur += String.fromCharCode(34);
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === ";" && !inQuotes) {
+        out.push(cur);
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    out.push(cur);
+    return out.map((s) => s.trim());
+  }
+
+  function normName(s: string): string {
+    return s
+      .toLowerCase()
+      .replace(/[^a-zа-я0-9]+/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  async function loadTables() {
+    try {
+      const procCsv = (await invoke("get_procedures_table")) as string;
+      const pm: Record<string, ProcInfo> = {};
+      for (const raw of procCsv.split(/\r?\n/)) {
+        if (!raw.trim()) continue;
+        const cols = parseCsvLine(raw);
+        if (cols.length < 4) continue;
+        const id = cols[0];
+        const name = cols[1] || "";
+        const equipment = cols[2] || "";
+        const parameters = cols[3] || "";
+        if (!name || id.indexOf("Идентификатор") === 0) continue;
+        pm[normName(name)] = { equipment, parameters };
+      }
+      proceduresMap = pm;
+    } catch (e) {
+      console.error("Не удалось загрузить Процедуры.csv", e);
+    }
+
+    try {
+      const lfkCsv = (await invoke("get_lfk_table")) as string;
+      const lm: Record<string, string> = {};
+      for (const raw of lfkCsv.split(/\r?\n/)) {
+        if (!raw.trim()) continue;
+        const cols = parseCsvLine(raw);
+        if (cols.length < 4) continue;
+        const name = cols[1] || "";
+        const equipment = cols[3] || "";
+        if (!name || cols[0] === "№") continue;
+        lm[normName(name)] = equipment;
+      }
+      lfkMap = lm;
+    } catch (e) {
+      console.error("Не удалось загрузить ЛФК.csv", e);
+    }
+  }
+
+  function findProcedure(text: string): ProcInfo | null {
+    const n = normName(text);
+    if (!n) return null;
+    if (proceduresMap[n]) return proceduresMap[n];
+    for (const key of Object.keys(proceduresMap)) {
+      if (key.indexOf(n) >= 0 || n.indexOf(key) >= 0) return proceduresMap[key];
+    }
+    return null;
+  }
+
+  function findLfk(text: string): string | null {
+    const n = normName(text);
+    if (!n) return null;
+    if (lfkMap[n]) return lfkMap[n];
+    for (const key of Object.keys(lfkMap)) {
+      if (key.indexOf(n) >= 0 || n.indexOf(key) >= 0) return lfkMap[key];
+    }
+    return null;
+  }
+
+  // Оборудование и параметры для каждой процедуры из ячейки (Физио)
+  function collectProcDetails(text: string): string[] {
+    const parts = text.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+    const res: string[] = [];
+    for (const p of parts) {
+      const info = findProcedure(p);
+      if (!info) continue;
+      const bits: string[] = [];
+      if (info.equipment && info.equipment !== "-") bits.push("Оборудование: " + info.equipment);
+      if (info.parameters && info.parameters !== "-") bits.push("Параметры: " + info.parameters);
+      if (bits.length) res.push(p + " — " + bits.join(" | "));
+    }
+    return res;
+  }
+
+  // Оборудование для каждой процедуры из ячейки (ЛФК)
+  function collectLfkDetails(text: string): string[] {
+    const parts = text.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+    const res: string[] = [];
+    for (const p of parts) {
+      const eq = findLfk(p);
+      if (eq && eq !== "-") res.push(p + " — Оборудование: " + eq);
+    }
+    return res;
   }
 
   function parseResult(response: string) {
@@ -296,25 +424,57 @@
     for (let r = 1; r < rows.length; r++) {
       const cells = rows[r].children;
 
-      if (physioIdx >= 0 && contraPhysioIdx >= 0) {
+      if (physioIdx >= 0) {
         const cell = cells[physioIdx] as HTMLElement | undefined;
-        const contra = cells[contraPhysioIdx] as HTMLElement | undefined;
-        if (cell && contra) {
-          const t = (contra.textContent || "").trim();
-          if (t) {
-            cell.setAttribute("data-contra", "Противопоказания: " + t);
+        if (cell) {
+          const cellText = (cell.textContent || "").trim();
+          const parts: string[] = [];
+
+          // Оборудование и параметры из Процедуры.csv
+          const details = collectProcDetails(cellText);
+          for (const d of details) parts.push(d);
+          if (details.length === 0) {
+            for (const part of cellText.split(/[,;]/).map((s) => s.trim()).filter(Boolean)) {
+              const info = findProcedure(part);
+              if (info && info.equipment && info.equipment !== "-") {
+                parts.push(part + " — Оборудование: " + info.equipment);
+              }
+            }
+          }
+
+          // Противопоказания
+          if (contraPhysioIdx >= 0) {
+            const contra = cells[contraPhysioIdx] as HTMLElement | undefined;
+            const t = contra ? (contra.textContent || "").trim() : "";
+            if (t) parts.push("Противопоказания: " + t);
+          }
+
+          if (parts.length) {
+            cell.setAttribute("data-contra", parts.join("\n"));
             cell.classList.add("with-contra");
           }
         }
       }
 
-      if (lfcIdx >= 0 && contraLfcIdx >= 0) {
+      if (lfcIdx >= 0) {
         const cell = cells[lfcIdx] as HTMLElement | undefined;
-        const contra = cells[contraLfcIdx] as HTMLElement | undefined;
-        if (cell && contra) {
-          const t = (contra.textContent || "").trim();
-          if (t) {
-            cell.setAttribute("data-contra", "Противопоказания: " + t);
+        if (cell) {
+          const cellText = (cell.textContent || "").trim();
+          const parts: string[] = [];
+
+          // Оборудование из ЛФК.csv
+          const details = collectLfkDetails(cellText);
+          for (const d of details) parts.push(d);
+
+          // Противопоказания
+          if (contraLfcIdx >= 0) {
+            const contra = cells[contraLfcIdx] as HTMLElement | undefined;
+            const t = contra ? (contra.textContent || "").trim() : "";
+            if (t) parts.push("Противопоказания: " + t);
+          }
+
+          if (parts.length) {
+            cell.setAttribute("data-contra", parts.join("\n"));
             cell.classList.add("with-contra");
           }
         }
@@ -1125,16 +1285,20 @@
     background:var(--surface);
     border:1.5px solid var(--accent);
     border-radius:6px;
-    padding:6px 10px;
+    padding:8px 12px;
     font-size:0.75rem;
-    line-height:1.4;
+    line-height:1.5;
     color:var(--text);
-    white-space:normal;
-    min-width:180px;
-    max-width:320px;
+    white-space:pre-line;
+    min-width:220px;
+    max-width:420px;
     z-index:100;
     box-shadow:0 4px 16px rgba(0,0,0,.2);
     pointer-events:none;
+    text-align:left;
+    text-transform:none;
+    letter-spacing:normal;
+    font-weight:400;
   }
 
   :global([data-theme="dark"] .with-contra:hover::after) {

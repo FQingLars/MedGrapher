@@ -6,6 +6,8 @@ use tauri::Manager;
 struct DbState(Mutex<Connection>);
 
 const CSV_CONTENT: &str = include_str!("../tables/МКФвКод.csv");
+const PROCEDURES_CSV: &str = include_str!("../tables/Процедуры.csv");
+const LFK_CSV: &str = include_str!("../tables/ЛФК.csv");
 const BASE: &str = "https://chat.qwen.ai";
 const MODEL: &str = "qwen3.7-plus";
 
@@ -302,6 +304,16 @@ async fn get_history_by_id(state: tauri::State<'_, DbState>, id: i64) -> Result<
 }
 
 #[tauri::command]
+fn get_procedures_table() -> String {
+    PROCEDURES_CSV.to_string()
+}
+
+#[tauri::command]
+fn get_lfk_table() -> String {
+    LFK_CSV.to_string()
+}
+
+#[tauri::command]
 async fn query_qwen(diagnoses: String, scales: Vec<String>, api_key: String) -> Result<String, String> {
     let token = api_key.trim();
     let diagnoses = diagnoses.trim();
@@ -454,7 +466,9 @@ pub fn run() {
             save_history,
             get_history,
             clear_old_history,
-            get_history_by_id
+            get_history_by_id,
+            get_procedures_table,
+            get_lfk_table
         ])
         .run(tauri::generate_context!())
     {

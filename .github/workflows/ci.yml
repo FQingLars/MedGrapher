@@ -1,42 +1,46 @@
-name: "CI"
+name: "Build (Windows + Linux)"
 
 on:
   workflow_dispatch:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
 permissions:
   contents: read
 
 jobs:
-  frontend:
-    name: Frontend build
-    runs-on: ubuntu-latest
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      # One platform failing must not cancel the other: we want to see both results.
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            platform: ubuntu-22.04
+            args: ""
+            bundle_glob: |
+              src-tauri/target/release/bundle/deb/*.deb
+              src-tauri/target/release/bundle/rpm/*.rpm
+          - name: windows-x64
+            platform: windows-latest
+            args: "--target x86_64-pc-windows-msvc"
+            bundle_glob: |
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              src-tauri/target/x86_64-pc-windows-msvc/release/medgrapher.exe
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 20
-          cache: npm
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Build frontend
-        run: npm run build
-
-  rust:
-    name: Rust check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
+      # Build on the oldest supported base (22.04) so the binary does not require
+      # a newer glibc than the systems we target.
       - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -48,7 +52,15 @@ jobs:
             libxdo-dev \
             libssl-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -57,6 +69,37 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
+          key: ${{ matrix.name }}
 
-      - name: Cargo check
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build bundles
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: "./src-tauri"
+          args: ${{ matrix.args }}
+          # Verification build: publish bundles as workflow artifacts, not as a release.
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: "medgrapher-${{ matrix.name }}-[bundle]"
+
+      - name: Verify bundles were produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            for f in $pattern; do
+              [ -e "$f" ] || continue
+              echo "FOUND: $f ($(du -h "$f" | cut -f1))"
+              found=$((found + 1))
+            done
+          done <<< "${{ matrix.bundle_glob }}"
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No bundles were produced for ${{ matrix.name }}"
+            exit 1
+          fi
+          echo "Produced $found artifact(s)."

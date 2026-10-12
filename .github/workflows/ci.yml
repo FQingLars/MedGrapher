@@ -12,9 +12,32 @@ permissions:
   contents: read
 
 jobs:
+  frontend:
+    name: Frontend (lint + build)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Svelte type-check
+        run: npm run check
+
+      - name: Build frontend (production)
+        run: npm run build
+
   build:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.platform }}
+    needs: frontend
     strategy:
       # One platform failing must not cancel the other: we want to see both results.
       fail-fast: false

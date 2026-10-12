@@ -9,7 +9,14 @@ const CSV_CONTENT: &str = include_str!("../tables/МКФвКод.csv");
 const PROCEDURES_CSV: &str = include_str!("../tables/Процедуры.csv");
 const LFK_CSV: &str = include_str!("../tables/ЛФК.csv");
 const BASE: &str = "https://chat.qwen.ai";
-const MODEL: &str = "qwen3.7-plus";
+const DEFAULT_MODEL: &str = "qwen3.7-plus";
+// Резервный список (id, отображаемое имя) — используется, если живой запрос
+// к {BASE}/api/models недоступен
+const FALLBACK_MODELS: &[(&str, &str)] = &[
+    ("qwen3.7-plus", "Qwen3.7-Plus"),
+    ("qwen3.8-max", "Qwen3.8-Max"),
+    ("qwen3.8-omni-flash", "Qwen3.8-Omni-Flash"),
+];
 
 fn uuid_v4() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -53,10 +60,10 @@ fn make_headers(token: &str, chat_id: Option<&str>) -> Result<reqwest::header::H
     Ok(h)
 }
 
-async fn create_chat(client: &reqwest::Client, token: &str) -> Result<String, String> {
+async fn create_chat(client: &reqwest::Client, token: &str, model: &str) -> Result<String, String> {
     let body = serde_json::json!({
         "title": "MedGrapher",
-        "models": [MODEL],
+        "models": [model],
         "chat_mode": "temporal",
         "chat_type": "t2t",
         "timestamp": ts_secs() * 1000,
@@ -98,6 +105,7 @@ async fn send_message(
     token: &str,
     chat_id: &str,
     prompt: &str,
+    model: &str,
 ) -> Result<String, String> {
     let ts = ts_secs();
     let user_fid = uuid_v4();
@@ -107,7 +115,7 @@ async fn send_message(
         "incremental_output": true,
         "chat_id": chat_id,
         "chat_mode": "temporal",
-        "model": MODEL,
+        "model": model,
         "parent_id": null,
         "messages": [{
             "fid": user_fid,
@@ -118,7 +126,7 @@ async fn send_message(
             "user_action": "chat",
             "files": [],
             "timestamp": ts,
-            "models": [MODEL],
+            "models": [model],
             "chat_type": "t2t",
             "feature_config": {
                 "thinking_enabled": false,
@@ -314,7 +322,12 @@ fn get_lfk_table() -> String {
 }
 
 #[tauri::command]
-async fn query_qwen(diagnoses: String, scales: Vec<String>, api_key: String) -> Result<String, String> {
+async fn query_qwen(
+    diagnoses: String,
+    scales: Vec<String>,
+    api_key: String,
+    model: Option<String>,
+) -> Result<String, String> {
     let token = api_key.trim();
     let diagnoses = diagnoses.trim();
 
@@ -329,6 +342,11 @@ async fn query_qwen(diagnoses: String, scales: Vec<String>, api_key: String) -> 
     }
 
     let scales_str = scales.join(", ");
+
+    let model = model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0")
@@ -382,8 +400,85 @@ async fn query_qwen(diagnoses: String, scales: Vec<String>, api_key: String) -> 
     );
     let prompt = build_prompt(system, &user);
 
-    let chat_id = create_chat(&client, token).await?;
-    send_message(&client, token, &chat_id, &prompt).await
+    let chat_id = create_chat(&client, token, &model).await?;
+    send_message(&client, token, &chat_id, &prompt, &model).await
+}
+
+#[derive(serde::Serialize)]
+struct ModelInfo {
+    id: String,
+    name: String,
+}
+
+fn fallback_models() -> Vec<ModelInfo> {
+    FALLBACK_MODELS
+        .iter()
+        .map(|(id, name)| ModelInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn get_available_models() -> Vec<ModelInfo> {
+    let client = match reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return fallback_models(),
+    };
+
+    let resp = match client.get(format!("{BASE}/api/models")).send().await {
+        Ok(r) => r,
+        Err(_) => return fallback_models(),
+    };
+    if !resp.status().is_success() {
+        return fallback_models();
+    }
+    let json: serde_json::Value = match resp.json().await {
+        Ok(j) => j,
+        Err(_) => return fallback_models(),
+    };
+
+    let mut models: Vec<ModelInfo> = Vec::new();
+    if let Some(items) = json["data"].as_array() {
+        for m in items {
+            let Some(id) = m["id"].as_str() else {
+                continue;
+            };
+            let id = id.trim().to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let preset = m["preset"].as_bool().unwrap_or(false);
+            let active = m["is_active"].as_bool().unwrap_or(false)
+                || m["info"]["is_active"].as_bool().unwrap_or(false);
+            if !(preset || active) {
+                continue;
+            }
+            let t2t = m["info"]["meta"]["chat_type"]
+                .as_array()
+                .map(|c| c.iter().any(|x| x.as_str() == Some("t2t")))
+                .unwrap_or(true);
+            if !t2t {
+                continue;
+            }
+            let raw_name = m["name"].as_str().unwrap_or("").trim().to_string();
+            let name = if raw_name.is_empty() { id.clone() } else { raw_name };
+            if !models.iter().any(|x| x.id == id) {
+                models.push(ModelInfo { id, name });
+            }
+        }
+    }
+
+    if models.is_empty() {
+        fallback_models()
+    } else {
+        models
+    }
 }
 
 fn install_panic_hook() {
@@ -468,7 +563,8 @@ pub fn run() {
             clear_old_history,
             get_history_by_id,
             get_procedures_table,
-            get_lfk_table
+            get_lfk_table,
+            get_available_models
         ])
         .run(tauri::generate_context!())
     {

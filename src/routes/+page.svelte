@@ -42,6 +42,22 @@
       notifyEnabled = savedNotify;
     }
 
+    try {
+      availableModels = (await invoke("get_available_models")) as ModelInfo[];
+    } catch {
+      availableModels = [{ id: "qwen3.7-plus", name: "Qwen3.7-Plus" }];
+    }
+    if (availableModels.length === 0) {
+      availableModels = [{ id: "qwen3.7-plus", name: "Qwen3.7-Plus" }];
+    }
+    if (!availableModels.some((m) => m.id === selectedModel)) {
+      selectedModel = availableModels[0].id;
+    }
+    const savedModel = await store.get<string>("model");
+    if (savedModel && availableModels.some((m) => m.id === savedModel)) {
+      selectedModel = savedModel;
+    }
+
     await loadTables();
 
     storeReady = true;
@@ -68,6 +84,7 @@
       store.set("autoClearEnabled", autoClearEnabled);
       store.set("retentionDays", retentionDays);
       store.set("notifyEnabled", notifyEnabled);
+      store.set("model", selectedModel);
       await store.save();
       if (autoClearEnabled) {
         invoke("clear_old_history", { retentionDays }).catch(() => {});
@@ -85,6 +102,14 @@
   let autoClearEnabled = $state(false);
   let retentionDays = $state(30);
   let notifyEnabled = $state(false);
+
+  interface ModelInfo {
+    id: string;
+    name: string;
+  }
+
+  let availableModels = $state<ModelInfo[]>([]);
+  let selectedModel = $state("qwen3.7-plus");
 
   interface HistoryItem {
     id: number;
@@ -276,6 +301,7 @@
         diagnoses: diagnoses.trim(),
         scales,
         apiKey: apiKey.trim(),
+        model: selectedModel,
       });
       parseResult(result as string);
       if (notifyEnabled) {
@@ -602,6 +628,13 @@
           <span class="toggle-knob"></span>
         </button>
       </div>
+
+      <label for="model-select">🤖 Модель Qwen (API)</label>
+      <select id="model-select" class="model-select" bind:value={selectedModel}>
+        {#each availableModels as m (m.id)}
+          <option value={m.id}>{m.name}</option>
+        {/each}
+      </select>
 
       <label for="k">Токен chat.qwen.ai</label>
       <input
@@ -1007,9 +1040,19 @@
     outline:none; width:100%;
     transition:border-color .2s,box-shadow .2s;
   }
-  .settings-modal input:focus {
+  .settings-modal input:focus,
+  .settings-modal select:focus {
     border-color:var(--accent);
     box-shadow:0 0 0 3px var(--glow);
+  }
+  .settings-modal select {
+    font-family:inherit; font-size:0.85rem;
+    padding:9px 12px;
+    border:2px solid var(--border-strong);
+    border-radius:8px; background:var(--surface); color:var(--text);
+    outline:none; width:100%;
+    transition:border-color .2s,box-shadow .2s;
+    cursor:pointer;
   }
 
   .instructions {

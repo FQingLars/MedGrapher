@@ -1054,6 +1054,16 @@
     transition:border-color .2s,box-shadow .2s;
     cursor:pointer;
   }
+  /* Нативный попап списка рендерится WebView2 с системным белым фоном, а текст
+     наследует цвет темы — задаём option'ам явные цвета для обеих тем */
+  .settings-modal select option {
+    background:#ffffff;
+    color:#0f172a;
+  }
+  :global([data-theme="dark"]) .settings-modal select option {
+    background:#141d2b;
+    color:#e2e8f0;
+  }
 
   .instructions {
     font-size:0.8rem; line-height:1.6;

@@ -45,13 +45,13 @@ jobs:
         include:
           - name: linux-x64
             platform: ubuntu-22.04
-            args: ""
+            args: "--bundles deb,rpm"
             bundle_glob: |
               src-tauri/target/release/bundle/deb/*.deb
               src-tauri/target/release/bundle/rpm/*.rpm
           - name: windows-x64
             platform: windows-latest
-            args: "--target x86_64-pc-windows-msvc"
+            args: "--target x86_64-pc-windows-msvc --bundles nsis"
             bundle_glob: |
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
               src-tauri/target/x86_64-pc-windows-msvc/release/medgrapher.exe

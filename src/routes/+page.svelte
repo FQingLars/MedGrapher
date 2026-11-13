@@ -45,10 +45,10 @@
     try {
       availableModels = (await invoke("get_available_models")) as ModelInfo[];
     } catch {
-      availableModels = [{ id: "qwen3.7-plus", name: "Qwen3.7-Plus" }];
+      availableModels = [{ id: "baidu/ernie-5.5-flash-preview:free", name: "ERNIE 5.5 Flash (free)" }];
     }
     if (availableModels.length === 0) {
-      availableModels = [{ id: "qwen3.7-plus", name: "Qwen3.7-Plus" }];
+      availableModels = [{ id: "baidu/ernie-5.5-flash-preview:free", name: "ERNIE 5.5 Flash (free)" }];
     }
     if (!availableModels.some((m) => m.id === selectedModel)) {
       selectedModel = availableModels[0].id;
@@ -109,7 +109,7 @@
   }
 
   let availableModels = $state<ModelInfo[]>([]);
-  let selectedModel = $state("qwen3.7-plus");
+  let selectedModel = $state("baidu/ernie-5.5-flash-preview:free");
 
   interface HistoryItem {
     id: number;
@@ -297,7 +297,7 @@
     applicableScales = [];
     visibleScales = [];
     try {
-      const result = await invoke("query_qwen", {
+      const result = await invoke("query_openrouter", {
         diagnoses: diagnoses.trim(),
         scales,
         apiKey: apiKey.trim(),
@@ -539,7 +539,7 @@
 <div class="shell">
   <header>
     <h1>MedGrapher</h1>
-    <span class="subtitle">МКФ · Физио · ЛФК через Qwen</span>
+    <span class="subtitle">МКФ · Физио · ЛФК через OpenRouter</span>
     <div class="header-actions">
       <button class="gear-btn" onclick={loadHistory} title="История запросов">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
@@ -629,26 +629,25 @@
         </button>
       </div>
 
-      <label for="model-select">🤖 Модель Qwen (API)</label>
+      <label for="model-select">🤖 Модель (OpenRouter)</label>
       <select id="model-select" class="model-select" bind:value={selectedModel}>
         {#each availableModels as m (m.id)}
           <option value={m.id}>{m.name}</option>
         {/each}
       </select>
 
-      <label for="k">Токен chat.qwen.ai</label>
+      <label for="k">API-ключ OpenRouter</label>
       <input
         id="k"
         type="password"
         bind:value={apiKey}
-        placeholder="eyJhbGciOiJIUzI1NiI..."
+        placeholder="sk-or-v1-..."
       />
       <div class="instructions">
-        <strong>Как получить токен:</strong>
+        <strong>Как получить ключ:</strong>
         <ol>
-          <li>Открой <code>chat.qwen.ai</code> в браузере и войди в аккаунт</li>
-          <li>Нажми <kbd>F12</kbd> → вкладка <strong>Application</strong> (Chrome) или <strong>Storage</strong> (Firefox)</li>
-          <li>Найди Cookies → <code>chat.qwen.ai</code> → скопируй значение <code>token</code></li>
+          <li>Открой <code>openrouter.ai/keys</code> и войди в аккаунт</li>
+          <li>Нажми <strong>Create Key</strong> и скопируй ключ (начинается с <code>sk-or-</code>)</li>
           <li>Вставь его в поле выше</li>
         </ol>
       </div>
@@ -748,7 +747,7 @@
       {#if loading}
         <div class="loading">
           <div class="dots"><span></span><span></span><span></span></div>
-          Qwen обрабатывает запрос…
+          Модель обрабатывает запрос…
         </div>
       {:else if renderedHtml}
         <div class="tables">
@@ -1072,7 +1071,7 @@
   }
   .instructions ol { margin:6px 0 0; padding-left:20px; }
   .instructions li { margin-bottom:4px; }
-  .instructions code, .instructions kbd {
+  .instructions code {
     background:color-mix(in srgb,var(--text2) 12%,transparent);
     padding:1px 5px; border-radius:4px;
     font-size:0.78rem;

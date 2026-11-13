@@ -1,234 +1,479 @@
+use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::SystemTime;
 use rusqlite::Connection;
 use tauri::Manager;
 
 struct DbState(Mutex<Connection>);
 
-const CSV_CONTENT: &str = include_str!("../tables/МКФвКод.csv");
 const PROCEDURES_CSV: &str = include_str!("../tables/Процедуры.csv");
 const LFK_CSV: &str = include_str!("../tables/ЛФК.csv");
-const BASE: &str = "https://chat.qwen.ai";
-const DEFAULT_MODEL: &str = "qwen3.7-plus";
-// Резервный список (id, отображаемое имя) — используется, если живой запрос
-// к {BASE}/api/models недоступен
+
+/// Встроенная компактная ВБД MedGrapher2 (без эмбеддингов): диагнозы, коды МКФ,
+/// противопоказания Физио/ЛФК. Используется для RAG-ретрива прямо в приложении.
+const RAG_DB: &[u8] = include_bytes!("../tables/medgrapher_rag.db");
+
+// ─────────────────────────── OpenRouter (OpenAI-compatible) ───────────────────────────
+const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
+const DEFAULT_MODEL: &str = "baidu/ernie-5.5-flash-preview:free";
+// Резервный список (id, отображаемое имя) — если живой запрос к /models недоступен
 const FALLBACK_MODELS: &[(&str, &str)] = &[
-    ("qwen3.7-plus", "Qwen3.7-Plus"),
-    ("qwen3.8-max", "Qwen3.8-Max"),
-    ("qwen3.8-omni-flash", "Qwen3.8-Omni-Flash"),
+    ("baidu/ernie-5.5-flash-preview:free", "ERNIE 5.5 Flash (free)"),
+    ("google/gemma-4-31b-it:free", "Gemma 4 31B (free)"),
+    ("nvidia/nemotron-3-ultra-550b-a55b:free", "Nemotron 3 Ultra 550B (free)"),
+    ("deepseek/deepseek-chat", "DeepSeek Chat"),
 ];
 
-fn uuid_v4() -> String {
-    uuid::Uuid::new_v4().to_string()
+// ─────────────────────────── RAG: модель данных ───────────────────────────
+struct Diag {
+    klin_diag: String,
+    norm: String,
+    tokens: Vec<String>,
+    mkb: String,
+    mkb_compact: String,
+    mcf_codes: Vec<String>,
+    physio: Vec<String>,
+    lfk: Vec<String>,
+    scales: Vec<String>,
 }
 
-fn ts_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+struct Proc {
+    name: String,
+    contra: Option<String>,
 }
 
-fn make_headers(token: &str, chat_id: Option<&str>) -> Result<reqwest::header::HeaderMap, String> {
-    let mut h = reqwest::header::HeaderMap::new();
+struct Card {
+    diagnosis: String,
+    mkb: String,
+    /// строки вида "код (название)"
+    mcf: Vec<String>,
+    scales: Vec<String>,
+    physio: Vec<Proc>,
+    lfk: Vec<Proc>,
+}
 
-    let mut insert = |key: &str, value: String| -> Result<(), String> {
-        let name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
-            .map_err(|e| format!("Недопустимое имя заголовка {key}: {e}"))?;
-        let val = reqwest::header::HeaderValue::from_str(&value)
-            .map_err(|e| format!("Недопустимое значение заголовка {key}: {e}"))?;
-        h.insert(name, val);
-        Ok(())
+/// Данные ВБД, загруженные в память при старте (только чтение).
+struct RagStore {
+    diags: Vec<Diag>,
+    icf_names: HashMap<String, String>,
+    physio_contra: HashMap<String, String>,
+    lfk_contra: HashMap<String, String>,
+    idf: HashMap<String, f32>,
+}
+
+fn normalize(s: &str) -> String {
+    let lower = s.to_lowercase().replace('ё', "е");
+    let mut out = String::new();
+    let mut prev_space = true;
+    for ch in lower.chars() {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn tokenize(s: &str) -> Vec<String> {
+    normalize(s)
+        .split(' ')
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn compact(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Нормализация ключа: убираем пробелы, обрамляющие кавычки и ведущий "Bearer ".
+fn normalize_api_key(raw: &str) -> String {
+    let mut k = raw.trim();
+    let b = k.as_bytes();
+    if b.len() >= 2 {
+        let first = b[0];
+        let last = b[b.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            k = k[1..k.len() - 1].trim();
+        }
+    }
+    if k.len() >= 7 && k[..7].eq_ignore_ascii_case("bearer ") {
+        k = k[7..].trim();
+    }
+    k.to_string()
+}
+
+fn split_items(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn load_contra(conn: &Connection, table: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let name_col = if table == "physio_contra" { "proc" } else { "item" };
+    if let Ok(mut stmt) = conn.prepare(&format!("SELECT {name_col}, contra FROM {table}")) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+            for row in rows.flatten() {
+                let (n, c) = row;
+                map.insert(n.trim().to_lowercase(), c);
+            }
+        }
+    }
+    map
+}
+
+/// Загрузка встроенной ВБД в память. Никогда не падает: при ошибке возвращает
+/// пустое хранилище (RAG просто не добавит контекст, запрос к LLM всё равно уйдёт).
+fn load_rag() -> RagStore {
+    let empty = RagStore {
+        diags: Vec::new(),
+        icf_names: HashMap::new(),
+        physio_contra: HashMap::new(),
+        lfk_contra: HashMap::new(),
+        idf: HashMap::new(),
     };
 
-    insert("Authorization", format!("Bearer {}", token))?;
-    insert("Content-Type", "application/json".to_string())?;
-    insert("Accept", "application/json".to_string())?;
-    insert(
-        "User-Agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_string(),
-    )?;
-    insert("Origin", BASE.to_string())?;
-    insert("Referer", format!("{BASE}/"))?;
-    insert("source", "h5".to_string())?;
-    insert("X-Request-Id", uuid_v4())?;
-    insert("Cookie", format!("token={token}"))?;
-    if let Some(cid) = chat_id {
-        insert("Referer", format!("{BASE}/c/{cid}"))?;
-        insert("x-accel-buffering", "no".to_string())?;
+    // Уникальное имя: load_rag может вызываться несколько раз (тесты идут
+    // параллельно), общий temp-файл дал бы гонку. После загрузки файл удаляем.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "medgrapher_rag_{}_{}.db",
+        std::process::id(),
+        uniq
+    ));
+    if let Err(e) = std::fs::write(&path, RAG_DB) {
+        eprintln!("RAG: не удалось записать ВБД во временный файл: {e}");
+        return empty;
     }
-    Ok(h)
-}
+    let conn = match Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("RAG: не удалось открыть ВБД: {e}");
+            let _ = std::fs::remove_file(&path);
+            return empty;
+        }
+    };
 
-async fn create_chat(client: &reqwest::Client, token: &str, model: &str) -> Result<String, String> {
-    let body = serde_json::json!({
-        "title": "MedGrapher",
-        "models": [model],
-        "chat_mode": "temporal",
-        "chat_type": "t2t",
-        "timestamp": ts_secs() * 1000,
-    });
+    let scale_names = [
+        "ВАШ",
+        "Ватерлоо",
+        "МакГилл",
+        "Рэнкин",
+        "Ашфорт",
+        "Бартел",
+        "Вейсс (мыш.сила)",
+        "Ривермид",
+        "Хаузер",
+        "Ходьба 6мин",
+        "Фрейнчай (FRAIL)",
+        "DN4",
+        "Шкала ДФ постинсульт",
+    ];
 
-    let resp = client
-        .post(format!("{BASE}/api/v2/chats/new"))
-        .headers(make_headers(token, None)?)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Ошибка создания чата: {e}"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Ошибка создания чата ({}): {}", status, text));
-    }
-
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Ошибка парсинга создания чата: {e}"))?;
-
-    if json.get("success").and_then(|s| s.as_bool()) == Some(false) {
-        let code = json["data"]["code"].as_str().unwrap_or("unknown");
-        let details = json["data"]["details"].as_str().unwrap_or("неизвестная ошибка");
-        return Err(format!("Ошибка API: {code} — {details}"));
-    }
-
-    json["data"]["id"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| "Не удалось получить chat_id".into())
-}
-
-async fn send_message(
-    client: &reqwest::Client,
-    token: &str,
-    chat_id: &str,
-    prompt: &str,
-    model: &str,
-) -> Result<String, String> {
-    let ts = ts_secs();
-    let user_fid = uuid_v4();
-
-    let body = serde_json::json!({
-        "stream": true,
-        "incremental_output": true,
-        "chat_id": chat_id,
-        "chat_mode": "temporal",
-        "model": model,
-        "parent_id": null,
-        "messages": [{
-            "fid": user_fid,
-            "parentId": null,
-            "childrenIds": [],
-            "role": "user",
-            "content": prompt,
-            "user_action": "chat",
-            "files": [],
-            "timestamp": ts,
-            "models": [model],
-            "chat_type": "t2t",
-            "feature_config": {
-                "thinking_enabled": false,
-                "output_schema": "phase",
-            },
-            "extra": {
-                "meta": {
-                    "subChatType": "t2t"
-                }
-            },
-            "sub_chat_type": "t2t",
-            "parent_id": null,
-        }],
-        "timestamp": ts,
-        "size": "1:1",
-    });
-
-    let resp = client
-        .post(format!("{BASE}/api/v2/chat/completions?chat_id={chat_id}"))
-        .headers(make_headers(token, Some(chat_id))?)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Ошибка отправки сообщения: {e}"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Ошибка API ({}): {}", status, text));
-    }
-
-    // Читаем SSE-поток: data: {...}
-    let mut full_text = String::new();
-    let mut stream = resp.bytes_stream();
-
-    use futures_util::StreamExt;
-    let mut buf = Vec::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Ошибка чтения потока: {e}"))?;
-        buf.extend_from_slice(&chunk);
-
-        loop {
-            // Ищем разделитель строк SSE (\n\n)
-            let delim = match buf.windows(2).position(|w| w == b"\n\n") {
-                Some(p) => p,
-                None => break,
-            };
-
-            let line = String::from_utf8_lossy(&buf[..delim]).trim().to_string();
-            buf.drain(..delim + 2);
-
-            if !line.starts_with("data: ") {
-                continue;
+    let mut diags = Vec::new();
+    let query = "SELECT klin_diag, mkb, mcf, physio, lfk, \
+                 Ваш, Ватерлоо, МакГилл, Рэнкин, Ашфорт, Бартел, \
+                 Вейсс_мыш_сила, Ривермид, Хаузер, Ходьба_6мин, Фрейнчай, DN4, Шкала_ДФ_постинсульт \
+                 FROM diagnoses";
+    {
+        let mut stmt = match conn.prepare(query) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("RAG: ошибка подготовки запроса диагнозов: {e}");
+                let _ = std::fs::remove_file(&path);
+                return empty;
             }
-            let data = &line[6..];
+        };
+        let rows = stmt.query_map([], |r| {
+            let klin: String = r.get(0)?;
+            let mkb: Option<String> = r.get(1)?;
+            let mcf: String = r.get(2)?;
+            let physio: String = r.get(3)?;
+            let lfk: String = r.get(4)?;
+            let flags: Vec<i64> = (5..18).map(|i| r.get(i).unwrap_or(0)).collect();
+            Ok((klin, mkb.unwrap_or_default(), mcf, physio, lfk, flags))
+        });
+        match rows {
+            Ok(rows) => {
+                for row in rows.flatten() {
+                    let (klin, mkb, mcf, physio, lfk, flags) = row;
+                    let scales: Vec<String> = scale_names
+                        .iter()
+                        .zip(flags.iter())
+                        .filter(|(_, v)| **v != 0)
+                        .map(|(n, _)| n.to_string())
+                        .collect();
+                    let tokens = tokenize(&klin);
+                    let norm = normalize(&klin);
+                    let mkb_compact = compact(&mkb);
+                    diags.push(Diag {
+                        klin_diag: klin,
+                        norm,
+                        tokens,
+                        mkb,
+                        mkb_compact,
+                        mcf_codes: split_items(&mcf)
+                            .into_iter()
+                            .map(|c| c.to_lowercase())
+                            .collect(),
+                        physio: split_items(&physio),
+                        lfk: split_items(&lfk),
+                        scales,
+                    });
+                }
+            }
+            Err(e) => eprintln!("RAG: ошибка чтения диагнозов: {e}"),
+        }
+    }
 
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                // Пропускаем response.created
-                if parsed.get("response.created").is_some() {
+    // документная частота токенов → IDF
+    let n = diags.len().max(1) as f32;
+    let mut df: HashMap<String, i64> = HashMap::new();
+    for d in &diags {
+        let mut seen: Vec<&String> = Vec::new();
+        for t in &d.tokens {
+            if !seen.contains(&t) {
+                seen.push(t);
+                *df.entry(t.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let idf: HashMap<String, f32> = df
+        .into_iter()
+        .map(|(t, c)| {
+            let v = ((n + 1.0) / (c as f32 + 1.0)).ln() + 1.0;
+            (t, v)
+        })
+        .collect();
+
+    let icf_names = {
+        let mut m = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT code, name FROM icf_codes") {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    let (c, nm) = row;
+                    m.insert(c.to_lowercase(), nm);
+                }
+            }
+        }
+        m
+    };
+
+    let physio_contra = load_contra(&conn, "physio_contra");
+    let lfk_contra = load_contra(&conn, "lfk_contra");
+
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
+
+    eprintln!(
+        "RAG: загружено диагнозов {}, кодов МКФ {}, физ. {}, лфк {}",
+        diags.len(),
+        icf_names.len(),
+        physio_contra.len(),
+        lfk_contra.len()
+    );
+
+    RagStore {
+        diags,
+        icf_names,
+        physio_contra,
+        lfk_contra,
+        idf,
+    }
+}
+
+fn find_contra(table: &HashMap<String, String>, name: &str) -> Option<String> {
+    let key = name.trim().to_lowercase();
+    if let Some(v) = table.get(&key) {
+        return Some(v.clone());
+    }
+    table
+        .iter()
+        .find(|(k, _)| key.contains(k.as_str()))
+        .map(|(_, v)| v.clone())
+}
+
+impl RagStore {
+    fn build_card(&self, idx: usize) -> Card {
+        let d = &self.diags[idx];
+        let mcf = d
+            .mcf_codes
+            .iter()
+            .map(|c| match self.icf_names.get(c) {
+                Some(name) => format!("{c} ({name})"),
+                None => c.clone(),
+            })
+            .collect();
+        let mk_proc = |items: &[String], table: &HashMap<String, String>| -> Vec<Proc> {
+            items
+                .iter()
+                .map(|it| Proc {
+                    name: it.clone(),
+                    contra: find_contra(table, it),
+                })
+                .collect()
+        };
+        Card {
+            diagnosis: d.klin_diag.clone(),
+            mkb: d.mkb.clone(),
+            mcf,
+            scales: d.scales.clone(),
+            physio: mk_proc(&d.physio, &self.physio_contra),
+            lfk: mk_proc(&d.lfk, &self.lfk_contra),
+        }
+    }
+}
+
+/// Лексический ретрив: для каждого фрагмента запроса (через ';' / перевод строки)
+/// считаем взвешенное пересечение токенов с диагнозами + бонус за МКБ-код и
+/// точное вхождение. Возвращаем top-N карточек, дедуплицированных по диагнозу.
+fn retrieve(store: &RagStore, query: &str, top: usize) -> Vec<Card> {
+    if store.diags.is_empty() || top == 0 {
+        return Vec::new();
+    }
+    let fragments: Vec<String> = query
+        .split(|c| c == ';' || c == '\n')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    let mut best: Vec<f32> = vec![0.0; store.diags.len()];
+
+    for frag in &fragments {
+        let qtokens = tokenize(frag);
+        let qnorm = normalize(frag);
+        let qcompact = compact(frag);
+        if qtokens.is_empty() && qcompact.is_empty() {
+            continue;
+        }
+        for (i, diag) in store.diags.iter().enumerate() {
+            let mut score = 0.0f32;
+            for qt in &qtokens {
+                if qt.len() < 3 {
                     continue;
                 }
-                // Проверяем choices
-                if let Some(choices) = parsed["choices"].as_array() {
-                    for choice in choices {
-                        let delta = &choice["delta"];
-                        // Проверяем статус finished
-                        if delta.get("status").and_then(|s| s.as_str()) == Some("finished") {
-                            // Поток закончен, возвращаем накопленный текст
-                            if full_text.is_empty() {
-                                // Если ответ пустой — пробуем взять последний content
-                                if let Some(c) = delta["content"].as_str() {
-                                    if !c.is_empty() {
-                                        full_text = c.to_string();
-                                    }
-                                }
-                            }
-                            return Ok(full_text);
-                        }
-                        // Накапливаем content фазы "answer"
-                        if let Some(content) = delta["content"].as_str() {
-                            if !content.is_empty() {
-                                full_text.push_str(content);
-                            }
-                        }
+                let idf = store.idf.get(qt).copied().unwrap_or(1.0);
+                let exact = diag.tokens.iter().any(|t| t == qt);
+                if exact {
+                    score += idf;
+                } else {
+                    let prefix = diag.tokens.iter().any(|t| {
+                        (t.len() >= 4 && qt.len() >= 4 && t.starts_with(qt.as_str()))
+                            || (t.len() >= 4 && qt.len() >= 4 && qt.starts_with(t.as_str()))
+                    });
+                    if prefix {
+                        score += idf * 0.6;
                     }
                 }
+            }
+            // точный МКБ-код
+            if !diag.mkb_compact.is_empty()
+                && diag.mkb_compact.len() >= 3
+                && qcompact.contains(&diag.mkb_compact)
+            {
+                score += 8.0;
+            }
+            // фразовое вхождение
+            if !qnorm.is_empty() {
+                if diag.norm == qnorm {
+                    score += 12.0;
+                } else if diag.norm.contains(&qnorm) || qnorm.contains(&diag.norm) {
+                    score += 6.0;
+                }
+            }
+            if score > best[i] {
+                best[i] = score;
             }
         }
     }
 
-    if full_text.is_empty() {
-        Err("Пустой ответ от API".into())
-    } else {
-        Ok(full_text)
+    let mut idx: Vec<usize> = (0..best.len()).filter(|&i| best[i] > 0.0).collect();
+    idx.sort_by(|&a, &b| {
+        best[b]
+            .partial_cmp(&best[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idx.truncate(top);
+    idx.into_iter().map(|i| store.build_card(i)).collect()
+}
+
+/// Компактный текстовый контекст из карточек для подстановки в промпт LLM.
+fn cards_to_context(cards: &[Card]) -> String {
+    let mut s = String::new();
+    for (i, c) in cards.iter().enumerate() {
+        s.push_str(&format!(
+            "{}. {}{}\n",
+            i + 1,
+            c.diagnosis,
+            if c.mkb.is_empty() {
+                String::new()
+            } else {
+                format!("  [МКБ: {}]", c.mkb)
+            }
+        ));
+        if !c.mcf.is_empty() {
+            s.push_str(&format!("   МКФ: {}\n", c.mcf.join("; ")));
+        }
+        s.push_str(&format!(
+            "   Шкалы: {}\n",
+            if c.scales.is_empty() {
+                "—".to_string()
+            } else {
+                c.scales.join(", ")
+            }
+        ));
+        let physio: Vec<String> = c
+            .physio
+            .iter()
+            .map(|p| match &p.contra {
+                Some(c) if !c.is_empty() => format!("{} (противопоказания: {})", p.name, c),
+                _ => p.name.clone(),
+            })
+            .collect();
+        s.push_str(&format!(
+            "   Физио: {}\n",
+            if physio.is_empty() {
+                "—".to_string()
+            } else {
+                physio.join("; ")
+            }
+        ));
+        let lfk: Vec<String> = c
+            .lfk
+            .iter()
+            .map(|p| match &p.contra {
+                Some(c) if !c.is_empty() => format!("{} (противопоказания: {})", p.name, c),
+                _ => p.name.clone(),
+            })
+            .collect();
+        s.push_str(&format!(
+            "   ЛФК: {}\n",
+            if lfk.is_empty() {
+                "—".to_string()
+            } else {
+                lfk.join("; ")
+            }
+        ));
     }
+    s
 }
 
-fn build_prompt(system: &str, user_content: &str) -> String {
-    format!("{system}\n\nUser: {user_content}")
-}
-
+// ─────────────────────────── История ───────────────────────────
 #[tauri::command]
 async fn save_history(
     state: tauri::State<'_, DbState>,
@@ -236,7 +481,10 @@ async fn save_history(
     scales: Vec<String>,
     response: String,
 ) -> Result<(), String> {
-    let db = state.0.lock().map_err(|e| format!("Ошибка блокировки БД: {e}"))?;
+    let db = state
+        .0
+        .lock()
+        .map_err(|e| format!("Ошибка блокировки БД: {e}"))?;
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let scales_str = scales.join(", ");
     db.execute(
@@ -258,7 +506,10 @@ struct HistoryEntry {
 
 #[tauri::command]
 async fn get_history(state: tauri::State<'_, DbState>) -> Result<Vec<HistoryEntry>, String> {
-    let db = state.0.lock().map_err(|e| format!("Ошибка блокировки БД: {e}"))?;
+    let db = state
+        .0
+        .lock()
+        .map_err(|e| format!("Ошибка блокировки БД: {e}"))?;
     let mut stmt = db
         .prepare("SELECT id, diagnoses, scales, response, created_at FROM query_history ORDER BY id DESC LIMIT 100")
         .map_err(|e| format!("Ошибка запроса: {e}"))?;
@@ -285,8 +536,14 @@ async fn get_history(state: tauri::State<'_, DbState>) -> Result<Vec<HistoryEntr
 }
 
 #[tauri::command]
-async fn clear_old_history(state: tauri::State<'_, DbState>, retention_days: i64) -> Result<u64, String> {
-    let db = state.0.lock().map_err(|e| format!("Ошибка блокировки БД: {e}"))?;
+async fn clear_old_history(
+    state: tauri::State<'_, DbState>,
+    retention_days: i64,
+) -> Result<u64, String> {
+    let db = state
+        .0
+        .lock()
+        .map_err(|e| format!("Ошибка блокировки БД: {e}"))?;
     let cutoff = chrono::Local::now() - chrono::Duration::days(retention_days);
     let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
     let deleted = db
@@ -300,7 +557,10 @@ async fn clear_old_history(state: tauri::State<'_, DbState>, retention_days: i64
 
 #[tauri::command]
 async fn get_history_by_id(state: tauri::State<'_, DbState>, id: i64) -> Result<String, String> {
-    let db = state.0.lock().map_err(|e| format!("Ошибка блокировки БД: {e}"))?;
+    let db = state
+        .0
+        .lock()
+        .map_err(|e| format!("Ошибка блокировки БД: {e}"))?;
     let response: String = db
         .query_row(
             "SELECT response FROM query_history WHERE id = ?1",
@@ -321,18 +581,45 @@ fn get_lfk_table() -> String {
     LFK_CSV.to_string()
 }
 
+// ─────────────────────────── RAG-поиск (для отладки/превью) ───────────────────────────
+#[derive(serde::Serialize)]
+struct RagResult {
+    context: String,
+    count: usize,
+}
+
 #[tauri::command]
-async fn query_qwen(
+fn rag_search(store: tauri::State<'_, RagStore>, query: String, top: Option<u32>) -> RagResult {
+    let top = top.unwrap_or(5).clamp(1, 20) as usize;
+    let cards = retrieve(&store, &query, top);
+    let count = cards.len();
+    RagResult {
+        context: cards_to_context(&cards),
+        count,
+    }
+}
+
+// ─────────────────────────── OpenRouter: запрос ───────────────────────────
+#[tauri::command]
+async fn query_openrouter(
+    state: tauri::State<'_, RagStore>,
     diagnoses: String,
     scales: Vec<String>,
     api_key: String,
     model: Option<String>,
 ) -> Result<String, String> {
-    let token = api_key.trim();
+    let token = normalize_api_key(&api_key);
     let diagnoses = diagnoses.trim();
 
     if token.is_empty() {
-        return Err("Не указан токен".into());
+        return Err("Не указан API-ключ OpenRouter".into());
+    }
+    if !token.starts_with("sk-or-") {
+        return Err(
+            "Неверный формат ключа OpenRouter: ожидается ключ вида 'sk-or-...' из openrouter.ai/keys \
+             (не токен Qwen и без слова 'Bearer')."
+                .into(),
+        );
     }
     if diagnoses.is_empty() {
         return Err("Не указаны клинические диагнозы".into());
@@ -348,8 +635,19 @@ async fn query_qwen(
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
+    // RAG: релевантные карточки из ВБД вместо дампа всего справочника МКФ
+    let cards = retrieve(&state, diagnoses, 6);
+    let rag_context = {
+        let ctx = cards_to_context(&cards);
+        if ctx.is_empty() {
+            "(релевантные карточки не найдены — используй свои знания)".to_string()
+        } else {
+            ctx
+        }
+    };
+
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0")
+        .user_agent("MedGrapher/1.0 (+https://openrouter.ai)")
         .build()
         .map_err(|e| format!("Ошибка HTTP-клиента: {e}"))?;
 
@@ -359,15 +657,21 @@ async fn query_qwen(
 
 Список доступных шкал для оценки: {scales_str}.
 
+Ниже — релевантные карточки из медицинской базы данных (RAG), подобранные по диагнозам. Используй их как основу: бери коды МКФ, процедуры Физио/ЛФК и противопоказания из этих карточек. Не выдумывай оборудование или процедуры, которых нет в карточках.
+
+=== КАРТОЧКИ RAG ===
+{rag_context}
+=== КОНЕЦ КАРТОЧЕК ===
+
 Ты можешь включить свои рассуждения и анализ ПЕРЕД основным ответом. Если ты это делаешь, ОБЯЗАТЕЛЬНО отдели свои рассуждения от данных разделителем &&& (три амперсанда на отдельной строке). После &&& должен идти ТОЛЬКО структурированный ответ, без каких-либо комментариев.
 
-ШАГ 1. Изучи все коды МКФ, которые ты подберёшь к данным диагнозам. Для каждого клинического диагноза подбери 4-7 кодов МКФ из разных категорий (b, d, s, e). Для каждого кода МКФ определи, применима ли к нему каждая из доступных шкал. Используй точные названия шкал из списка выше.
+ШАГ 1. Изучи коды МКФ из карточек выше, которые подходят к данным диагнозам. Для каждого клинического диагноза подбери 4-7 кодов МКФ из разных категорий (b, d, s, e). Для каждого кода МКФ определи, применима ли к нему каждая из доступных шкал. Используй точные названия шкал из списка выше.
 
 ФОРМАТ ВЫВОДА:
 - Таблица 1 должна содержать ровно 4-7 строк с кодами МКФ для каждого диагноза
-- Столбец Код МКФ должен содержать коды в формате如下: b28016, b7100, b7302, b7352, d450 (по одному коду из каждой подходящей категории)
-- Столбцы Процедуры Физио и ЛФК должны заполняться только оборудованием из соответствующих CSV таблиц Процедуры.csv и ЛФК.csv
-- Если оборудование из таблицы не подходит к коду МКФ, поставь прочерк (-)
+- Столбец Код МКФ должен содержать коды в формате: b28016, b7100, b7302, b7352, d450 (по одному коду из каждой подходящей категории)
+- Столбцы Процедуры Физио и ЛФК должны заполняться только оборудованием/процедурами из карточек RAG
+- Если процедура из карточек не подходит к коду МКФ, поставь прочерк (-)
 - Противопоказания от одного диагноза применяются ко всем диагнозам пациента
 
 ШАГ 2. После &&& (или сразу, если рассуждений нет) на отдельной строке выведи только список шкал, которые оказались применимы хотя бы к одному коду МКФ (через запятую, без лишнего текста). Например: ВАШ, Мак-Гилла...
@@ -388,22 +692,103 @@ async fn query_qwen(
 Столбцы: Клинический диагноз, Код МКФ, ЛФК, Физио.
 
 **Таблица 4 — Справочник кодов МКФ**
-Для каждого кода МКФ, который ты использовал в таблицах выше, выведи его код и полное название из справочника.
+Для каждого кода МКФ, который ты использовал в таблицах выше, выведи его код и полное название из карточек RAG (или из своих знаний, если кода нет в карточках).
 Столбцы: Код МКФ, Название МКФ.
 
 Учитывай, что все предоставленные диагнозы относятся к одному пациенту: противопоказания от одного диагноза применяются ко всем.
 
-Прежде чем формировать таблицы, удостоверься в их правильности (корректный Markdown, чтобы правильно парсился).
-
-Таблица кодов МКФ и их названий:
-\n\n{CSV_CONTENT}"
+Прежде чем формировать таблицы, удостоверься в их правильности (корректный Markdown, чтобы правильно парсился)."
     );
-    let prompt = build_prompt(system, &user);
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ],
+        "stream": true,
+    });
 
-    let chat_id = create_chat(&client, token, &model).await?;
-    send_message(&client, token, &chat_id, &prompt, &model).await
+    let resp = client
+        .post(format!("{OPENROUTER_BASE}/chat/completions"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .header("X-Title", "MedGrapher")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Ошибка запроса к OpenRouter: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(
+                "OpenRouter отклонил ключ (401). Проверьте, что вставлен корректный ключ из \
+                 openrouter.ai/keys (формат sk-or-...), без слова 'Bearer' и лишних символов."
+                    .into(),
+            );
+        }
+        return Err(format!("Ошибка OpenRouter ({status}): {text}"));
+    }
+
+    // SSE-поток OpenAI-совместимого формата: data: {...}
+    use futures_util::StreamExt;
+    let mut full_text = String::new();
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Ошибка чтения потока: {e}"))?;
+        buf.extend_from_slice(&chunk);
+
+        loop {
+            let delim = match buf.windows(2).position(|w| w == b"\n\n") {
+                Some(p) => p,
+                None => break,
+            };
+            let line = String::from_utf8_lossy(&buf[..delim]).trim().to_string();
+            buf.drain(..delim + 2);
+
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" {
+                return if full_text.is_empty() {
+                    Err("Пустой ответ от модели".into())
+                } else {
+                    Ok(full_text)
+                };
+            }
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            if let Some(err) = parsed.get("error") {
+                return Err(format!(
+                    "Ошибка модели: {}",
+                    err["message"].as_str().unwrap_or("неизвестная ошибка")
+                ));
+            }
+            if let Some(choices) = parsed["choices"].as_array() {
+                for choice in choices {
+                    if let Some(content) = choice["delta"]["content"].as_str() {
+                        if !content.is_empty() {
+                            full_text.push_str(content);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if full_text.is_empty() {
+        Err("Пустой ответ от модели".into())
+    } else {
+        Ok(full_text)
+    }
 }
 
+// ─────────────────────────── OpenRouter: список моделей ───────────────────────────
 #[derive(serde::Serialize)]
 struct ModelInfo {
     id: String,
@@ -423,15 +808,20 @@ fn fallback_models() -> Vec<ModelInfo> {
 #[tauri::command]
 async fn get_available_models() -> Vec<ModelInfo> {
     let client = match reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0")
-        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("MedGrapher/1.0 (+https://openrouter.ai)")
+        .timeout(std::time::Duration::from_secs(15))
         .build()
     {
         Ok(c) => c,
         Err(_) => return fallback_models(),
     };
 
-    let resp = match client.get(format!("{BASE}/api/models")).send().await {
+    let resp = match client
+        .get(format!("{OPENROUTER_BASE}/models"))
+        .header("X-Title", "MedGrapher")
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(_) => return fallback_models(),
     };
@@ -449,27 +839,17 @@ async fn get_available_models() -> Vec<ModelInfo> {
             let Some(id) = m["id"].as_str() else {
                 continue;
             };
-            let id = id.trim().to_string();
-            if id.is_empty() {
+            let id = id.trim();
+            if id.is_empty() || id.ends_with(":batch") {
                 continue;
             }
-            let preset = m["preset"].as_bool().unwrap_or(false);
-            let active = m["is_active"].as_bool().unwrap_or(false)
-                || m["info"]["is_active"].as_bool().unwrap_or(false);
-            if !(preset || active) {
-                continue;
-            }
-            let t2t = m["info"]["meta"]["chat_type"]
-                .as_array()
-                .map(|c| c.iter().any(|x| x.as_str() == Some("t2t")))
-                .unwrap_or(true);
-            if !t2t {
-                continue;
-            }
-            let raw_name = m["name"].as_str().unwrap_or("").trim().to_string();
-            let name = if raw_name.is_empty() { id.clone() } else { raw_name };
+            let name = m["name"].as_str().unwrap_or(id).trim();
+            let name = if name.is_empty() { id } else { name };
             if !models.iter().any(|x| x.id == id) {
-                models.push(ModelInfo { id, name });
+                models.push(ModelInfo {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                });
             }
         }
     }
@@ -510,6 +890,9 @@ fn install_panic_hook() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     install_panic_hook();
+
+    // ВБД для RAG грузим один раз при старте (из встроенных байтов).
+    let rag = load_rag();
 
     if let Err(e) = tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::new().build())
@@ -556,8 +939,10 @@ pub fn run() {
             app.manage(DbState(Mutex::new(conn)));
             Ok(())
         })
+        .manage(rag)
         .invoke_handler(tauri::generate_handler![
-            query_qwen,
+            query_openrouter,
+            rag_search,
             save_history,
             get_history,
             clear_old_history,
@@ -569,5 +954,80 @@ pub fn run() {
         .run(tauri::generate_context!())
     {
         eprintln!("Ошибка запуска приложения: {e}");
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_and_normalize() {
+        assert_eq!(normalize("  Коксартроз, 2 ст.! "), "коксартроз 2 ст");
+        assert_eq!(tokenize("Инфаркт головного мозга"), vec!["инфаркт", "головного", "мозга"]);
+        assert_eq!(compact("A01.0"), "a010");
+    }
+
+    #[test]
+    fn api_key_normalization() {
+        assert_eq!(normalize_api_key("  sk-or-abc  "), "sk-or-abc");
+        assert_eq!(normalize_api_key("Bearer sk-or-abc"), "sk-or-abc");
+        assert_eq!(normalize_api_key("bearer   sk-or-abc"), "sk-or-abc");
+        assert_eq!(normalize_api_key("\"sk-or-abc\""), "sk-or-abc");
+        assert_eq!(normalize_api_key("'sk-or-abc'"), "sk-or-abc");
+        assert_eq!(normalize_api_key("  "), "");
+        // токен Qwen не должен пройти как ключ OpenRouter
+        assert!(!normalize_api_key("eyJhbGciOiJIUzI1NiJ9").starts_with("sk-or-"));
+    }
+
+    #[test]
+    fn rag_finds_pneumonia() {
+        let store = load_rag();
+        assert!(!store.diags.is_empty(), "ВБД не загрузилась");
+        let cards = retrieve(&store, "внебольничная пневмония", 5);
+        assert!(!cards.is_empty(), "ничего не найдено");
+        assert!(
+            cards.iter().any(|c| c.diagnosis.to_lowercase().contains("пневмон")),
+            "нет пневмонии в топе: {:?}",
+            cards.iter().map(|c| &c.diagnosis).collect::<Vec<_>>()
+        );
+        // у карточек должны быть коды МКФ и шкалы
+        assert!(cards.iter().any(|c| !c.mcf.is_empty()));
+        let ctx = cards_to_context(&cards);
+        assert!(ctx.contains("МКФ:"));
+    }
+
+    #[test]
+    fn rag_finds_by_mkb_code() {
+        let store = load_rag();
+        let cards = retrieve(&store, "J12", 3);
+        assert!(!cards.is_empty(), "по коду J12 ничего не найдено");
+        assert!(cards.iter().any(|c| c.mkb.eq_ignore_ascii_case("J12")));
+    }
+
+    #[test]
+    fn rag_handles_multiple_fragments() {
+        let store = load_rag();
+        let cards = retrieve(&store, "коксоартроз; инфаркт головного мозга", 8);
+        assert!(cards.len() >= 2, "ожидалось ≥2 карточки, получено {}", cards.len());
+    }
+
+    /// Golden-тест: точный RAG-контекст для фиксированного запроса.
+    /// Перегенерация: UPDATE_GOLDEN=1 cargo test --lib golden_rag_context
+    #[test]
+    fn golden_rag_context() {
+        let store = load_rag();
+        let cards = retrieve(&store, "внебольничная пневмония", 2);
+        let ctx = cards_to_context(&cards);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/rag_context_pneumonia.txt");
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &ctx).unwrap();
+            return;
+        }
+        let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+            panic!("нет golden-файла {}; запусти UPDATE_GOLDEN=1 cargo test --lib golden_rag_context", path.display())
+        });
+        assert_eq!(expected, ctx);
     }
 }

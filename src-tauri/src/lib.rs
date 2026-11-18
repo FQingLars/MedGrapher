@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use rusqlite::Connection;
 use tauri::Manager;
@@ -95,6 +95,12 @@ struct RagStore {
     contra_full: Vec<ContraRow>,
     proc_icf: Vec<ProcIcfRow>,
     documents: Vec<DocumentRow>,
+    /// Нормализованные имена разрешённых процедур (Физио/ЛФК) — для фильтрации.
+    allowed_physio: HashSet<String>,
+    allowed_lfk: HashSet<String>,
+    /// Те же списки в исходном написании — для подстановки в промпт.
+    allowed_physio_display: Vec<String>,
+    allowed_lfk_display: Vec<String>,
     idf: HashMap<String, f32>,
 }
 
@@ -154,6 +160,26 @@ fn split_items(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Названия ЛФК-процедур из ЛФК.csv (колонка «Название»).
+fn parse_lfk_names(csv: &str) -> Vec<String> {
+    csv.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split(';').collect();
+            if cols.len() >= 2 {
+                let n = cols[1].trim();
+                if !n.is_empty() && n != "Название" {
+                    Some(n.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn load_contra(conn: &Connection, table: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let name_col = if table == "physio_contra" { "proc" } else { "item" };
@@ -198,6 +224,10 @@ fn load_rag() -> RagStore {
         contra_full: Vec::new(),
         proc_icf: Vec::new(),
         documents: Vec::new(),
+        allowed_physio: HashSet::new(),
+        allowed_lfk: HashSet::new(),
+        allowed_physio_display: Vec::new(),
+        allowed_lfk_display: Vec::new(),
         idf: HashMap::new(),
     };
 
@@ -385,6 +415,57 @@ fn load_rag() -> RagStore {
         },
     );
 
+    // Allow-list существующих процедур Физио/ЛФК (для ограничения генерации).
+    let mut allowed_physio: HashSet<String> = HashSet::new();
+    let mut allowed_physio_display: Vec<String> = Vec::new();
+    {
+        let add = |name: &str,
+               set: &mut HashSet<String>,
+               disp: &mut Vec<String>| {
+            let n = normalize(name);
+            if !n.is_empty() && set.insert(n) {
+                disp.push(name.trim().to_string());
+            }
+        };
+        for p in &procedures {
+            add(&p.name, &mut allowed_physio, &mut allowed_physio_display);
+        }
+        for k in physio_contra.keys() {
+            add(k, &mut allowed_physio, &mut allowed_physio_display);
+        }
+        for d in &diags {
+            for it in &d.physio {
+                add(it, &mut allowed_physio, &mut allowed_physio_display);
+            }
+        }
+    }
+
+    let mut allowed_lfk: HashSet<String> = HashSet::new();
+    let mut allowed_lfk_display: Vec<String> = Vec::new();
+    {
+        let add = |name: &str,
+               set: &mut HashSet<String>,
+               disp: &mut Vec<String>| {
+            let n = normalize(name);
+            if !n.is_empty() && set.insert(n) {
+                disp.push(name.trim().to_string());
+            }
+        };
+        for k in lfk_contra.keys() {
+            add(k, &mut allowed_lfk, &mut allowed_lfk_display);
+        }
+        for name in parse_lfk_names(LFK_CSV) {
+            add(&name, &mut allowed_lfk, &mut allowed_lfk_display);
+        }
+        for d in &diags {
+            for it in &d.lfk {
+                add(it, &mut allowed_lfk, &mut allowed_lfk_display);
+            }
+        }
+    }
+    allowed_physio_display.sort();
+    allowed_lfk_display.sort();
+
     drop(conn);
     let _ = std::fs::remove_file(&path);
 
@@ -399,6 +480,11 @@ fn load_rag() -> RagStore {
         proc_icf.len(),
         documents.len()
     );
+    eprintln!(
+        "RAG: allow-list процедур — Физио {}, ЛФК {}",
+        allowed_physio.len(),
+        allowed_lfk.len()
+    );
 
     RagStore {
         diags,
@@ -409,6 +495,10 @@ fn load_rag() -> RagStore {
         contra_full,
         proc_icf,
         documents,
+        allowed_physio,
+        allowed_lfk,
+        allowed_physio_display,
+        allowed_lfk_display,
         idf,
     }
 }
@@ -613,6 +703,147 @@ fn fmt_proc(p: &Proc) -> String {
     } else {
         format!("{} — {}", p.name, parts.join("; "))
     }
+}
+
+/// Разбиение строки markdown-таблицы на ячейки (с учётом `\|`).
+fn split_md_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut escaped = false;
+    for ch in t.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            cur.push(ch);
+            escaped = true;
+        } else if ch == '|' {
+            cells.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+/// Строка-разделитель markdown-таблицы (`|---|---|`).
+fn is_separator_row(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.chars().all(|c| c == '|' || c == '-' || c == ':' || c == ' ')
+}
+
+/// Оставляет в ячейке только процедуры, входящие в allow-list.
+fn filter_cell_procedures(cell: &str, allowed: &HashSet<String>) -> String {
+    let items: Vec<&str> = cell
+        .split([',', ';'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if items.is_empty() {
+        return cell.to_string();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    for it in items {
+        let n = normalize(it);
+        if n.is_empty() {
+            continue;
+        }
+        let ok = allowed.contains(&n)
+            || allowed
+                .iter()
+                .any(|a| a.contains(n.as_str()) || n.contains(a.as_str()));
+        if ok {
+            kept.push(it);
+        }
+    }
+    if kept.is_empty() {
+        "-".to_string()
+    } else {
+        kept.join(", ")
+    }
+}
+
+/// Фильтрует процедуры Физио/ЛФК в markdown-таблицах ответа LLM: удаляет
+/// процедуры, которых нет в allow-list (чтобы модель не выдумывала, напр.
+/// «электросон»). Обрабатывается только часть после `<tables_start>`.
+fn filter_markdown_procedures(
+    md: &str,
+    allowed_physio: &HashSet<String>,
+    allowed_lfk: &HashSet<String>,
+) -> String {
+    let marker = "<tables_start>";
+    let (head, body) = match md.find(marker) {
+        Some(i) => {
+            let split = i + marker.len();
+            (&md[..split], &md[split..])
+        }
+        None => ("", md),
+    };
+
+    let lines: Vec<&str> = body.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    // (индекс колонки, это ЛФК?)
+    let mut proc_cols: Vec<(usize, bool)> = Vec::new();
+    let mut in_table = false;
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        if !trimmed.starts_with('|') {
+            proc_cols.clear();
+            in_table = false;
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        let next_is_sep = i + 1 < lines.len() && is_separator_row(lines[i + 1]);
+        if next_is_sep {
+            // header row → определяем колонки процедур
+            proc_cols.clear();
+            for (idx, h) in split_md_row(trimmed).iter().enumerate() {
+                let hl = h.to_lowercase();
+                if hl.contains("физио") && !hl.contains("против") {
+                    proc_cols.push((idx, false));
+                } else if hl.contains("лфк") && !hl.contains("против") {
+                    proc_cols.push((idx, true));
+                }
+            }
+            in_table = true;
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        if is_separator_row(trimmed) {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        if in_table && !proc_cols.is_empty() {
+            let mut cells = split_md_row(trimmed);
+            for (idx, is_lfk) in &proc_cols {
+                if *idx < cells.len() {
+                    let allowed = if *is_lfk { allowed_lfk } else { allowed_physio };
+                    cells[*idx] = filter_cell_procedures(&cells[*idx], allowed);
+                }
+            }
+            out.push(format!("| {} |", cells.join(" | ")));
+        } else {
+            out.push(line.to_string());
+        }
+        i += 1;
+    }
+
+    format!("{head}{}", out.join("\n"))
 }
 
 /// Компактный текстовый контекст из карточек для подстановки в промпт LLM.
@@ -930,6 +1161,8 @@ async fn query_openrouter(
         .map_err(|e| format!("Ошибка HTTP-клиента: {e}"))?;
 
     let system = "Ты — медицинский ассистент, эксперт по МКФ, физиотерапии и ЛФК. Отвечай строго по запросу, без лишнего текста.";
+    let physio_allowed = state.allowed_physio_display.join(", ");
+    let lfk_allowed = state.allowed_lfk_display.join(", ");
     let user = format!(
         "Даны клинические диагнозы: {diagnoses}.
 
@@ -941,6 +1174,11 @@ async fn query_openrouter(
 {rag_context}
 === КОНЕЦ КАРТОЧЕК ===
 
+=== РАЗРЕШЁННЫЕ ПРОЦЕДУРЫ (используй ТОЛЬКО точные названия отсюда; НЕ придумывай новых — например, «электросон» и любые процедуры, которых нет в списке, ЗАПРЕЩЕНЫ) ===
+Физио: {physio_allowed}
+ЛФК: {lfk_allowed}
+=== КОНЕЦ СПИСКА ===
+
 Ты можешь включить свои рассуждения и анализ ПЕРЕД основным ответом. Если ты это делаешь, ОБЯЗАТЕЛЬНО отдели свои рассуждения от данных разделителем &&& (три амперсанда на отдельной строке). После &&& должен идти ТОЛЬКО структурированный ответ, без каких-либо комментариев.
 
 ШАГ 1. Изучи коды МКФ из карточек выше, которые подходят к данным диагнозам. Для каждого клинического диагноза подбери 4-7 кодов МКФ из разных категорий (b, d, s, e). Для каждого кода МКФ определи, применима ли к нему каждая из доступных шкал. Используй точные названия шкал из списка выше.
@@ -948,8 +1186,8 @@ async fn query_openrouter(
 ФОРМАТ ВЫВОДА:
 - Таблица 1 должна содержать ровно 4-7 строк с кодами МКФ для каждого диагноза
 - Столбец Код МКФ должен содержать коды в формате: b28016, b7100, b7302, b7352, d450 (по одному коду из каждой подходящей категории)
-- Столбцы Процедуры Физио и ЛФК должны заполняться только оборудованием/процедурами из карточек RAG
-- Если процедура из карточек не подходит к коду МКФ, поставь прочерк (-)
+- Столбцы Процедуры Физио и ЛФК должны заполняться ТОЛЬКО процедурами из списка РАЗРЕШЁННЫХ (выше). Придумывать процедуры/аппараты запрещено.
+- Если ни одна из разрешённых процедур не подходит к коду МКФ, поставь прочерк (-)
 - Противопоказания от одного диагноза применяются ко всем диагнозам пациента
 
 ШАГ 2. После &&& (или сразу, если рассуждений нет) на отдельной строке выведи только список шкал, которые оказались применимы хотя бы к одному коду МКФ (через запятую, без лишнего текста). Например: ВАШ, Мак-Гилла...
@@ -1035,7 +1273,11 @@ async fn query_openrouter(
                 return if full_text.is_empty() {
                     Err("Пустой ответ от модели".into())
                 } else {
-                    Ok(full_text)
+                    Ok(filter_markdown_procedures(
+                        &full_text,
+                        &state.allowed_physio,
+                        &state.allowed_lfk,
+                    ))
                 };
             }
             let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) else {
@@ -1062,7 +1304,11 @@ async fn query_openrouter(
     if full_text.is_empty() {
         Err("Пустой ответ от модели".into())
     } else {
-        Ok(full_text)
+        Ok(filter_markdown_procedures(
+            &full_text,
+            &state.allowed_physio,
+            &state.allowed_lfk,
+        ))
     }
 }
 
@@ -1288,6 +1534,32 @@ mod tests {
         let store = load_rag();
         let cards = retrieve(&store, "коксоартроз; инфаркт головного мозга", 8);
         assert!(cards.len() >= 2, "ожидалось ≥2 карточки, получено {}", cards.len());
+    }
+
+    #[test]
+    fn filters_unknown_procedures() {
+        let mut physio = HashSet::new();
+        physio.insert(normalize("Магнитотерапия общая"));
+        physio.insert(normalize("Электрофорез"));
+        let mut lfk = HashSet::new();
+        lfk.insert(normalize("Дыхательная гимнастика"));
+
+        let md = "| Клинический диагноз | Код МКФ | Процедуры Физио | Противопоказания Физио | ЛФК | Противопоказания ЛФК |\n\
+|---|---|---|---|---|---|\n\
+| Инсульт | b440 | Магнитотерапия общая, Электросон | нет | Дыхательная гимнастика, Аквааэробика | нет |\n";
+        let out = filter_markdown_procedures(md, &physio, &lfk);
+        assert!(out.contains("Магнитотерапия общая"), "разрешённая осталась: {out}");
+        assert!(!out.contains("Электросон"), "выдуманная удалена: {out}");
+        assert!(out.contains("Дыхательная гимнастика"), "ЛФК осталась: {out}");
+        assert!(!out.contains("Аквааэробика"), "ЛФК выдуманная удалена: {out}");
+        // противопоказания не трогаем
+        assert!(out.contains("Противопоказания Физио"));
+
+        // таблица 3: Клинический диагноз | Код МКФ | ЛФК | Физио
+        let md2 = "| Клинический диагноз | Код МКФ | ЛФК | Физио |\n|---|---|---|---|\n\
+| Инсульт | b440 | Аквааэробика | Электросон |\n";
+        let out2 = filter_markdown_procedures(md2, &physio, &lfk);
+        assert!(out2.contains("| - | - |"), "обе колонки стали '-': {out2}");
     }
 
     #[test]

@@ -12,6 +12,8 @@
   let storeReady = $state(false);
   let darkMode = $state(false);
 
+  const DEFAULT_MODEL = "baidu/ernie-5.5-flash-preview:free";
+
   function applyTheme(dark: boolean) {
     document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
   }
@@ -42,20 +44,20 @@
       notifyEnabled = savedNotify;
     }
 
-    try {
-      availableModels = (await invoke("get_available_models")) as ModelInfo[];
-    } catch {
-      availableModels = [{ id: "baidu/ernie-5.5-flash-preview:free", name: "ERNIE 5.5 Flash (free)" }];
-    }
-    if (availableModels.length === 0) {
-      availableModels = [{ id: "baidu/ernie-5.5-flash-preview:free", name: "ERNIE 5.5 Flash (free)" }];
-    }
-    if (!availableModels.some((m) => m.id === selectedModel)) {
-      selectedModel = availableModels[0].id;
+    // Реестр моделей OpenRouter: список добавленных по ID, выбор активной.
+    const savedRegistry = await store.get<ModelEntry[]>("modelRegistry");
+    if (Array.isArray(savedRegistry) && savedRegistry.length > 0) {
+      modelRegistry = savedRegistry
+        .filter((m) => m && typeof m.id === "string" && m.id.trim() !== "")
+        .map((m) => ({ id: m.id.trim(), name: m.name?.trim() || m.id.trim() }));
+    } else {
+      modelRegistry = [{ id: DEFAULT_MODEL, name: "ERNIE 5.5 Flash (free)" }];
     }
     const savedModel = await store.get<string>("model");
-    if (savedModel && availableModels.some((m) => m.id === savedModel)) {
+    if (savedModel && modelRegistry.some((m) => m.id === savedModel)) {
       selectedModel = savedModel;
+    } else if (!modelRegistry.some((m) => m.id === selectedModel)) {
+      selectedModel = modelRegistry[0].id;
     }
 
     await loadTables();
@@ -85,11 +87,48 @@
       store.set("retentionDays", retentionDays);
       store.set("notifyEnabled", notifyEnabled);
       store.set("model", selectedModel);
+      store.set("modelRegistry", modelRegistry);
       await store.save();
       if (autoClearEnabled) {
         invoke("clear_old_history", { retentionDays }).catch(() => {});
       }
     }
+  }
+
+  // ── Реестр моделей OpenRouter ──
+  function persistModels() {
+    if (!storeReady || !store) return;
+    store.set("modelRegistry", modelRegistry);
+    store.set("model", selectedModel);
+    store.save().catch(() => {});
+  }
+
+  function selectModel(id: string) {
+    if (selectedModel === id) return;
+    selectedModel = id;
+    persistModels();
+  }
+
+  function addModel() {
+    const id = newModelId.trim();
+    if (!id) return;
+    const existing = modelRegistry.find((m) => m.id === id);
+    if (existing) {
+      selectedModel = id;
+    } else {
+      modelRegistry = [...modelRegistry, { id, name: id }];
+      selectedModel = id;
+    }
+    newModelId = "";
+    persistModels();
+  }
+
+  function removeModel(id: string) {
+    modelRegistry = modelRegistry.filter((m) => m.id !== id);
+    if (selectedModel === id) {
+      selectedModel = modelRegistry[0]?.id ?? DEFAULT_MODEL;
+    }
+    persistModels();
   }
 
   let diagnoses = $state("");
@@ -103,13 +142,14 @@
   let retentionDays = $state(30);
   let notifyEnabled = $state(false);
 
-  interface ModelInfo {
+  interface ModelEntry {
     id: string;
     name: string;
   }
 
-  let availableModels = $state<ModelInfo[]>([]);
-  let selectedModel = $state("baidu/ernie-5.5-flash-preview:free");
+  let modelRegistry = $state<ModelEntry[]>([]);
+  let newModelId = $state("");
+  let selectedModel = $state(DEFAULT_MODEL);
 
   interface HistoryItem {
     id: number;
@@ -368,6 +408,89 @@
     selectedHistory = null;
   }
 
+  // ── Справочник (процедуры / противопоказания / МКФ / протокол) ──
+  interface RefProcedure {
+    name: string;
+    apparatus: string;
+    parameters: string;
+    time: string;
+    course: string;
+  }
+  interface RefContra {
+    procedure: string;
+    absolute: string;
+    relative: string;
+  }
+  interface RefProcIcf {
+    procedure: string;
+    icfCodes: string;
+    indications: string;
+    rationale: string;
+    effect: string;
+  }
+  interface RefDocument {
+    id: number;
+    title: string;
+    source: string;
+    content: string;
+  }
+  interface ReferenceData {
+    procedures: RefProcedure[];
+    contraindications: RefContra[];
+    procIcf: RefProcIcf[];
+    documents: RefDocument[];
+  }
+
+  let showReference = $state(false);
+  let reference = $state<ReferenceData | null>(null);
+  let refLoading = $state(false);
+  let refError = $state("");
+  let refTab = $state<"procedures" | "contra" | "icf" | "protocol">("procedures");
+  let refSearch = $state("");
+
+  async function openReference() {
+    showReference = true;
+    if (reference || refLoading) return;
+    refLoading = true;
+    refError = "";
+    try {
+      reference = (await invoke("get_reference_data")) as ReferenceData;
+    } catch (e) {
+      refError = String(e);
+    } finally {
+      refLoading = false;
+    }
+  }
+
+  function closeReference() {
+    showReference = false;
+  }
+
+  let refProcedures = $derived.by(() => {
+    if (!reference) return [];
+    const q = refSearch.trim().toLowerCase();
+    if (!q) return reference.procedures;
+    return reference.procedures.filter((p) =>
+      (p.name + " " + p.apparatus + " " + p.parameters).toLowerCase().includes(q),
+    );
+  });
+  let refContra = $derived.by(() => {
+    if (!reference) return [];
+    const q = refSearch.trim().toLowerCase();
+    if (!q) return reference.contraindications;
+    return reference.contraindications.filter((c) =>
+      (c.procedure + " " + c.absolute + " " + c.relative).toLowerCase().includes(q),
+    );
+  });
+  let refIcf = $derived.by(() => {
+    if (!reference) return [];
+    const q = refSearch.trim().toLowerCase();
+    if (!q) return reference.procIcf;
+    return reference.procIcf.filter((p) =>
+      (p.procedure + " " + p.icfCodes + " " + p.indications).toLowerCase().includes(q),
+    );
+  });
+
   let resultContainer: HTMLElement;
 
   function applyColumnVisibility() {
@@ -523,7 +646,7 @@
 <svelte:head>
   <title>MedGrapher</title>
   <style media="print">
-    header, aside, .pdf-btn, .history-panel, .settings-modal, .settings-overlay { display:none !important; }
+    header, aside, .pdf-btn, .history-panel, .reference-panel, .settings-modal, .settings-overlay { display:none !important; }
     .shell { padding:0 !important; max-width:100% !important; }
     .layout { display:block !important; }
     main { overflow:visible !important; }
@@ -541,6 +664,9 @@
     <h1>MedGrapher</h1>
     <span class="subtitle">МКФ · Физио · ЛФК через OpenRouter</span>
     <div class="header-actions">
+      <button class="gear-btn" onclick={openReference} title="Справочник">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+      </button>
       <button class="gear-btn" onclick={loadHistory} title="История запросов">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
       </button>
@@ -630,11 +756,49 @@
       </div>
 
       <label for="model-select">🤖 Модель (OpenRouter)</label>
-      <select id="model-select" class="model-select" bind:value={selectedModel}>
-        {#each availableModels as m (m.id)}
-          <option value={m.id}>{m.name}</option>
-        {/each}
-      </select>
+      {#if modelRegistry.length > 0}
+        <select id="model-select" class="model-select" bind:value={selectedModel} onchange={persistModels}>
+          {#each modelRegistry as m (m.id)}
+            <option value={m.id}>{m.name}</option>
+          {/each}
+        </select>
+      {:else}
+        <div class="registry-empty">Список моделей пуст — добавьте модель по ID ниже.</div>
+      {/if}
+
+      <div class="add-model-row">
+        <input
+          id="new-model"
+          type="text"
+          bind:value={newModelId}
+          placeholder="ID модели, например anthropic/claude-3.5-sonnet"
+          onkeydown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              addModel();
+            }
+          }}
+        />
+        <button class="add-btn" onclick={addModel} disabled={!newModelId.trim()}>+ Добавить</button>
+      </div>
+
+      {#if modelRegistry.length > 0}
+        <ul class="model-list">
+          {#each modelRegistry as m (m.id)}
+            <li class:active={m.id === selectedModel}>
+              <button class="model-pick" onclick={() => selectModel(m.id)} title={m.id}>
+                <span class="model-name">{m.name}</span>
+                <span class="model-id">{m.id}</span>
+              </button>
+              <button class="model-del" onclick={() => removeModel(m.id)} title="Удалить модель">✕</button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      <div class="registry-hint">
+        Скопируйте ID модели со страницы <code>openrouter.ai/models</code> и добавьте в реестр.
+        Можно добавить несколько и переключаться между ними.
+      </div>
 
       <label for="k">API-ключ OpenRouter</label>
       <input
@@ -683,6 +847,100 @@
                 <div class="history-date">{entry.created_at}</div>
               </button>
             {/each}
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/if}
+
+  {#if showReference}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <div class="settings-overlay" role="presentation" onclick={closeReference}></div>
+    <div class="history-panel reference-panel" transition:fade={{ duration: 150 }}>
+      <div class="settings-header">
+        <span>📚 Справочник</span>
+        <button class="gear-btn" onclick={closeReference} title="Закрыть">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+
+      <div class="ref-tabs">
+        <button class:active={refTab === "procedures"} onclick={() => { refTab = "procedures"; refSearch = ""; }}>Процедуры</button>
+        <button class:active={refTab === "contra"} onclick={() => { refTab = "contra"; refSearch = ""; }}>Противопоказания</button>
+        <button class:active={refTab === "icf"} onclick={() => { refTab = "icf"; refSearch = ""; }}>Процедуры ↔ МКФ</button>
+        <button class:active={refTab === "protocol"} onclick={() => { refTab = "protocol"; refSearch = ""; }}>Протокол</button>
+      </div>
+
+      {#if refLoading}
+        <div class="loading">Загрузка справочника…</div>
+      {:else if refError}
+        <div class="error">{refError}</div>
+      {:else if reference}
+        {#if refTab !== "protocol"}
+          <input
+            class="ref-search"
+            type="text"
+            bind:value={refSearch}
+            placeholder="Поиск по названию…"
+          />
+        {/if}
+        <div class="ref-body">
+          {#if refTab === "procedures"}
+            <table class="ref-table">
+              <thead><tr><th>Процедура</th><th>Аппарат</th><th>Параметры</th><th>Время</th><th>Курс</th></tr></thead>
+              <tbody>
+                {#each refProcedures as p (p.name)}
+                  <tr>
+                    <td class="ref-name">{p.name}</td>
+                    <td>{p.apparatus || "—"}</td>
+                    <td>{p.parameters || "—"}</td>
+                    <td>{p.time || "—"}</td>
+                    <td>{p.course || "—"}</td>
+                  </tr>
+                {/each}
+                {#if refProcedures.length === 0}<tr><td colspan="5" class="ref-empty">Ничего не найдено</td></tr>{/if}
+              </tbody>
+            </table>
+          {:else if refTab === "contra"}
+            <table class="ref-table">
+              <thead><tr><th>Процедура</th><th>Абсолютные противопоказания</th><th>Относительные противопоказания</th></tr></thead>
+              <tbody>
+                {#each refContra as c (c.procedure)}
+                  <tr>
+                    <td class="ref-name">{c.procedure}</td>
+                    <td>{c.absolute || "—"}</td>
+                    <td>{c.relative || "—"}</td>
+                  </tr>
+                {/each}
+                {#if refContra.length === 0}<tr><td colspan="3" class="ref-empty">Ничего не найдено</td></tr>{/if}
+              </tbody>
+            </table>
+          {:else if refTab === "icf"}
+            <table class="ref-table">
+              <thead><tr><th>Процедура</th><th>Коды МКФ</th><th>Показания</th><th>Ожидаемый эффект</th></tr></thead>
+              <tbody>
+                {#each refIcf as p (p.procedure)}
+                  <tr>
+                    <td class="ref-name">{p.procedure}</td>
+                    <td class="ref-icf">{p.icfCodes || "—"}</td>
+                    <td>{p.indications || "—"}</td>
+                    <td>{p.effect || "—"}</td>
+                  </tr>
+                {/each}
+                {#if refIcf.length === 0}<tr><td colspan="4" class="ref-empty">Ничего не найдено</td></tr>{/if}
+              </tbody>
+            </table>
+          {:else}
+            <div class="ref-protocol">
+              {#each reference.documents as doc (doc.id)}
+                <h3>{doc.title}</h3>
+                <div class="ref-source">Источник: {doc.source}</div>
+                <pre>{doc.content}</pre>
+              {/each}
+              {#if reference.documents.length === 0}
+                <div class="ref-empty">Документы не найдены</div>
+              {/if}
+            </div>
           {/if}
         </div>
       {/if}
@@ -1064,6 +1322,116 @@
     color:#e2e8f0;
   }
 
+  .add-model-row {
+    display:flex;
+    gap:8px;
+  }
+  .add-model-row input {
+    flex:1;
+    min-width:0;
+  }
+  .add-btn {
+    flex-shrink:0;
+    padding:9px 14px;
+    font-size:0.82rem;
+    white-space:nowrap;
+  }
+  .model-list {
+    list-style:none;
+    margin:0;
+    padding:0;
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+    max-height:220px;
+    overflow-y:auto;
+  }
+  .model-list li {
+    display:flex;
+    align-items:stretch;
+    gap:6px;
+    border:1.5px solid var(--border);
+    border-radius:8px;
+    background:var(--bg);
+    overflow:hidden;
+    transition:border-color .15s;
+  }
+  .model-list li.active {
+    border-color:var(--accent);
+    background:color-mix(in srgb,var(--accent) 10%,transparent);
+  }
+  .model-pick {
+    flex:1;
+    min-width:0;
+    display:flex;
+    flex-direction:column;
+    align-items:flex-start;
+    gap:2px;
+    padding:8px 10px;
+    background:transparent;
+    border:none;
+    box-shadow:none;
+    color:var(--text);
+    text-align:left;
+    font-weight:500;
+    cursor:pointer;
+  }
+  .model-pick:hover { transform:none; box-shadow:none; }
+  .model-name {
+    font-size:0.84rem;
+    font-weight:600;
+    max-width:100%;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .model-id {
+    font-size:0.72rem;
+    color:var(--text2);
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    max-width:100%;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .model-del {
+    flex-shrink:0;
+    width:34px;
+    padding:0;
+    background:transparent;
+    border:none;
+    border-left:1.5px solid var(--border);
+    color:var(--text2);
+    font-size:0.9rem;
+    box-shadow:none;
+    cursor:pointer;
+  }
+  .model-del:hover:not(:disabled) {
+    color:#ef4444;
+    background:color-mix(in srgb,#ef4444 10%,transparent);
+    transform:none;
+    box-shadow:none;
+  }
+  .registry-empty {
+    font-size:0.8rem;
+    color:var(--text2);
+    background:var(--bg);
+    padding:10px 12px;
+    border-radius:8px;
+    border:1.5px dashed var(--border-strong);
+  }
+  .registry-hint {
+    font-size:0.74rem;
+    line-height:1.5;
+    color:var(--text2);
+  }
+  .registry-hint code {
+    background:color-mix(in srgb,var(--text2) 12%,transparent);
+    padding:1px 5px;
+    border-radius:4px;
+    font-size:0.72rem;
+  }
+
   .instructions {
     font-size:0.8rem; line-height:1.6;
     color:var(--text2); background:var(--bg);
@@ -1248,6 +1616,102 @@
     background:linear-gradient(135deg,#6366f1,#8b5cf6);
     color:#fff;
     font-weight:600;
+  }
+
+  .reference-panel {
+    width: 900px;
+    max-width: 94vw;
+    max-height: 86vh;
+  }
+  .ref-tabs {
+    display:flex;
+    gap:6px;
+    flex-wrap:wrap;
+  }
+  .ref-tabs button {
+    padding:7px 12px;
+    font-size:0.8rem;
+    border-radius:8px;
+    border:1.5px solid var(--border-strong);
+    background:var(--bg);
+    color:var(--text);
+    box-shadow:none;
+    font-weight:600;
+  }
+  .ref-tabs button:hover { transform:none; box-shadow:none; }
+  .ref-tabs button.active {
+    border-color:var(--accent);
+    background:color-mix(in srgb,var(--accent) 12%,transparent);
+    color:var(--accent);
+  }
+  .ref-search {
+    font-family:inherit;
+    font-size:0.85rem;
+    padding:8px 12px;
+    border:2px solid var(--border-strong);
+    border-radius:8px;
+    background:var(--surface);
+    color:var(--text);
+    outline:none;
+    width:100%;
+  }
+  .ref-search:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--glow); }
+  .ref-body {
+    overflow-y:auto;
+    overflow-x:auto;
+    max-height:58vh;
+    flex:1;
+    min-height:0;
+  }
+  .ref-table {
+    border-collapse:collapse;
+    width:100%;
+    font-size:0.76rem;
+    line-height:1.45;
+  }
+  .ref-table th,
+  .ref-table td {
+    border:1.5px solid var(--border-strong);
+    padding:5px 8px;
+    text-align:left;
+    vertical-align:top;
+    word-break:break-word;
+    overflow-wrap:break-word;
+  }
+  .ref-table th {
+    background:linear-gradient(135deg,#6366f1,#8b5cf6);
+    color:#fff;
+    font-weight:600;
+    position:sticky;
+    top:0;
+  }
+  .ref-table tr:nth-child(even) td { background:color-mix(in srgb,var(--bg) 50%,transparent); }
+  .ref-name { font-weight:600; white-space:nowrap; }
+  .ref-icf {
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:0.72rem;
+    color:var(--accent);
+  }
+  .ref-empty {
+    text-align:center;
+    color:var(--text2);
+    padding:18px;
+  }
+  .ref-protocol {
+    font-size:0.82rem;
+    line-height:1.55;
+  }
+  .ref-protocol h3 { margin:6px 0 2px; }
+  .ref-source { color:var(--text2); font-size:0.74rem; margin-bottom:8px; }
+  .ref-protocol pre {
+    white-space:pre-wrap;
+    word-break:break-word;
+    background:var(--bg);
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:12px 14px;
+    font-size:0.78rem;
+    margin:0 0 18px;
   }
 
   main {

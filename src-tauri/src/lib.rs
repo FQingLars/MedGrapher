@@ -39,6 +39,13 @@ struct Diag {
 struct Proc {
     name: String,
     contra: Option<String>,
+    absolute: Option<String>,
+    relative: Option<String>,
+    apparatus: Option<String>,
+    parameters: Option<String>,
+    icf_codes: Option<String>,
+    indications: Option<String>,
+    effect: Option<String>,
 }
 
 struct Card {
@@ -51,12 +58,43 @@ struct Card {
     lfk: Vec<Proc>,
 }
 
+// ── Справочные таблицы (из docx/pdf) ──
+struct ProcRow {
+    name: String,
+    apparatus: String,
+    parameters: String,
+    time: String,
+    course: String,
+}
+struct ContraRow {
+    procedure: String,
+    absolute: String,
+    relative: String,
+}
+struct ProcIcfRow {
+    procedure: String,
+    icf_codes: String,
+    indications: String,
+    rationale: String,
+    effect: String,
+}
+struct DocumentRow {
+    id: i64,
+    title: String,
+    source: String,
+    content: String,
+}
+
 /// Данные ВБД, загруженные в память при старте (только чтение).
 struct RagStore {
     diags: Vec<Diag>,
     icf_names: HashMap<String, String>,
     physio_contra: HashMap<String, String>,
     lfk_contra: HashMap<String, String>,
+    procedures: Vec<ProcRow>,
+    contra_full: Vec<ContraRow>,
+    proc_icf: Vec<ProcIcfRow>,
+    documents: Vec<DocumentRow>,
     idf: HashMap<String, f32>,
 }
 
@@ -132,6 +170,22 @@ fn load_contra(conn: &Connection, table: &str) -> HashMap<String, String> {
     map
 }
 
+/// Универсальная загрузка строк таблицы (без паники при ошибке).
+fn load_rows<T, F>(conn: &Connection, sql: &str, map: F) -> Vec<T>
+where
+    F: FnMut(&rusqlite::Row) -> rusqlite::Result<T>,
+{
+    let mut out = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(sql) {
+        if let Ok(rows) = stmt.query_map([], map) {
+            for r in rows.flatten() {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
 /// Загрузка встроенной ВБД в память. Никогда не падает: при ошибке возвращает
 /// пустое хранилище (RAG просто не добавит контекст, запрос к LLM всё равно уйдёт).
 fn load_rag() -> RagStore {
@@ -140,6 +194,10 @@ fn load_rag() -> RagStore {
         icf_names: HashMap::new(),
         physio_contra: HashMap::new(),
         lfk_contra: HashMap::new(),
+        procedures: Vec::new(),
+        contra_full: Vec::new(),
+        proc_icf: Vec::new(),
+        documents: Vec::new(),
         idf: HashMap::new(),
     };
 
@@ -276,15 +334,70 @@ fn load_rag() -> RagStore {
     let physio_contra = load_contra(&conn, "physio_contra");
     let lfk_contra = load_contra(&conn, "lfk_contra");
 
+    // Справочные таблицы из docx/pdf
+    let procedures = load_rows(
+        &conn,
+        "SELECT name, apparatus, parameters, time_min, course_days FROM procedures ORDER BY id",
+        |r| {
+            Ok(ProcRow {
+                name: r.get(0)?,
+                apparatus: r.get(1)?,
+                parameters: r.get(2)?,
+                time: r.get(3)?,
+                course: r.get(4)?,
+            })
+        },
+    );
+    let contra_full = load_rows(
+        &conn,
+        "SELECT procedure, absolute, relative FROM contra_full",
+        |r| {
+            Ok(ContraRow {
+                procedure: r.get(0)?,
+                absolute: r.get(1)?,
+                relative: r.get(2)?,
+            })
+        },
+    );
+    let proc_icf = load_rows(
+        &conn,
+        "SELECT procedure, icf_codes, indications, rationale, effect FROM proc_icf",
+        |r| {
+            Ok(ProcIcfRow {
+                procedure: r.get(0)?,
+                icf_codes: r.get(1)?,
+                indications: r.get(2)?,
+                rationale: r.get(3)?,
+                effect: r.get(4)?,
+            })
+        },
+    );
+    let documents = load_rows(
+        &conn,
+        "SELECT id, title, source, content FROM documents ORDER BY id",
+        |r| {
+            Ok(DocumentRow {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                source: r.get(2)?,
+                content: r.get(3)?,
+            })
+        },
+    );
+
     drop(conn);
     let _ = std::fs::remove_file(&path);
 
     eprintln!(
-        "RAG: загружено диагнозов {}, кодов МКФ {}, физ. {}, лфк {}",
+        "RAG: загружено диагнозов {}, кодов МКФ {}, физ. {}, лфк {}; процедур {}, прот. {}, МКФ-таблиц {}, документов {}",
         diags.len(),
         icf_names.len(),
         physio_contra.len(),
-        lfk_contra.len()
+        lfk_contra.len(),
+        procedures.len(),
+        contra_full.len(),
+        proc_icf.len(),
+        documents.len()
     );
 
     RagStore {
@@ -292,6 +405,10 @@ fn load_rag() -> RagStore {
         icf_names,
         physio_contra,
         lfk_contra,
+        procedures,
+        contra_full,
+        proc_icf,
+        documents,
         idf,
     }
 }
@@ -305,6 +422,42 @@ fn find_contra(table: &HashMap<String, String>, name: &str) -> Option<String> {
         .iter()
         .find(|(k, _)| key.contains(k.as_str()))
         .map(|(_, v)| v.clone())
+}
+
+/// Пустое/прочерк → None.
+fn ne(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() || t == "-" {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Поиск строки по имени: точное совпадение (нормализованное), затем подстрока.
+fn find_row<'a, T>(rows: &'a [T], name: &str, key: impl Fn(&T) -> &str) -> Option<&'a T> {
+    let k = normalize(name);
+    if k.is_empty() {
+        return None;
+    }
+    if let Some(r) = rows.iter().find(|r| normalize(key(r)) == k) {
+        return Some(r);
+    }
+    rows.iter().find(|r| {
+        let kk = normalize(key(r));
+        !kk.is_empty() && (kk.contains(&k) || k.contains(kk.as_str()))
+    })
+}
+
+/// Обрезка длинного текста для контекста LLM.
+fn trunc(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max {
+        return t.to_string();
+    }
+    let mut out: String = t.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 impl RagStore {
@@ -321,9 +474,32 @@ impl RagStore {
         let mk_proc = |items: &[String], table: &HashMap<String, String>| -> Vec<Proc> {
             items
                 .iter()
-                .map(|it| Proc {
-                    name: it.clone(),
-                    contra: find_contra(table, it),
+                .map(|it| {
+                    let mut p = Proc {
+                        name: it.clone(),
+                        contra: find_contra(table, it),
+                        absolute: None,
+                        relative: None,
+                        apparatus: None,
+                        parameters: None,
+                        icf_codes: None,
+                        indications: None,
+                        effect: None,
+                    };
+                    if let Some(c) = find_row(&self.contra_full, it, |r| &r.procedure) {
+                        p.absolute = ne(&c.absolute);
+                        p.relative = ne(&c.relative);
+                    }
+                    if let Some(pi) = find_row(&self.procedures, it, |r| &r.name) {
+                        p.apparatus = ne(&pi.apparatus);
+                        p.parameters = ne(&pi.parameters);
+                    }
+                    if let Some(picf) = find_row(&self.proc_icf, it, |r| &r.procedure) {
+                        p.icf_codes = ne(&picf.icf_codes);
+                        p.indications = ne(&picf.indications);
+                        p.effect = ne(&picf.effect);
+                    }
+                    p
                 })
                 .collect()
         };
@@ -412,6 +588,33 @@ fn retrieve(store: &RagStore, query: &str, top: usize) -> Vec<Card> {
     idx.into_iter().map(|i| store.build_card(i)).collect()
 }
 
+/// Одна процедура в контексте LLM: имя + аппаратура/параметры/МКФ/противопоказания.
+fn fmt_proc(p: &Proc) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(a) = &p.apparatus {
+        parts.push(format!("аппарат: {}", trunc(a, 150)));
+    }
+    if let Some(pm) = &p.parameters {
+        parts.push(format!("параметры: {}", trunc(pm, 150)));
+    }
+    if let Some(icf) = &p.icf_codes {
+        parts.push(format!("МКФ: {}", trunc(icf, 120)));
+    }
+    if let Some(c) = &p.absolute {
+        parts.push(format!("противопоказания (абс): {}", trunc(c, 220)));
+    } else if let Some(c) = &p.contra {
+        parts.push(format!("противопоказания: {}", trunc(c, 220)));
+    }
+    if let Some(c) = &p.relative {
+        parts.push(format!("относит: {}", trunc(c, 160)));
+    }
+    if parts.is_empty() {
+        p.name.clone()
+    } else {
+        format!("{} — {}", p.name, parts.join("; "))
+    }
+}
+
 /// Компактный текстовый контекст из карточек для подстановки в промпт LLM.
 fn cards_to_context(cards: &[Card]) -> String {
     let mut s = String::new();
@@ -437,14 +640,7 @@ fn cards_to_context(cards: &[Card]) -> String {
                 c.scales.join(", ")
             }
         ));
-        let physio: Vec<String> = c
-            .physio
-            .iter()
-            .map(|p| match &p.contra {
-                Some(c) if !c.is_empty() => format!("{} (противопоказания: {})", p.name, c),
-                _ => p.name.clone(),
-            })
-            .collect();
+        let physio: Vec<String> = c.physio.iter().map(fmt_proc).collect();
         s.push_str(&format!(
             "   Физио: {}\n",
             if physio.is_empty() {
@@ -453,14 +649,7 @@ fn cards_to_context(cards: &[Card]) -> String {
                 physio.join("; ")
             }
         ));
-        let lfk: Vec<String> = c
-            .lfk
-            .iter()
-            .map(|p| match &p.contra {
-                Some(c) if !c.is_empty() => format!("{} (противопоказания: {})", p.name, c),
-                _ => p.name.clone(),
-            })
-            .collect();
+        let lfk: Vec<String> = c.lfk.iter().map(fmt_proc).collect();
         s.push_str(&format!(
             "   ЛФК: {}\n",
             if lfk.is_empty() {
@@ -596,6 +785,95 @@ fn rag_search(store: tauri::State<'_, RagStore>, query: String, top: Option<u32>
     RagResult {
         context: cards_to_context(&cards),
         count,
+    }
+}
+
+// ─────────────────────────── Справочник (docx/pdf) ───────────────────────────
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RefProcedure {
+    name: String,
+    apparatus: String,
+    parameters: String,
+    time: String,
+    course: String,
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RefContra {
+    procedure: String,
+    absolute: String,
+    relative: String,
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RefProcIcf {
+    procedure: String,
+    icf_codes: String,
+    indications: String,
+    rationale: String,
+    effect: String,
+}
+#[derive(serde::Serialize)]
+struct RefDocument {
+    id: i64,
+    title: String,
+    source: String,
+    content: String,
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReferenceData {
+    procedures: Vec<RefProcedure>,
+    contraindications: Vec<RefContra>,
+    proc_icf: Vec<RefProcIcf>,
+    documents: Vec<RefDocument>,
+}
+
+#[tauri::command]
+fn get_reference_data(state: tauri::State<'_, RagStore>) -> ReferenceData {
+    ReferenceData {
+        procedures: state
+            .procedures
+            .iter()
+            .map(|p| RefProcedure {
+                name: p.name.clone(),
+                apparatus: p.apparatus.clone(),
+                parameters: p.parameters.clone(),
+                time: p.time.clone(),
+                course: p.course.clone(),
+            })
+            .collect(),
+        contraindications: state
+            .contra_full
+            .iter()
+            .map(|c| RefContra {
+                procedure: c.procedure.clone(),
+                absolute: c.absolute.clone(),
+                relative: c.relative.clone(),
+            })
+            .collect(),
+        proc_icf: state
+            .proc_icf
+            .iter()
+            .map(|p| RefProcIcf {
+                procedure: p.procedure.clone(),
+                icf_codes: p.icf_codes.clone(),
+                indications: p.indications.clone(),
+                rationale: p.rationale.clone(),
+                effect: p.effect.clone(),
+            })
+            .collect(),
+        documents: state
+            .documents
+            .iter()
+            .map(|d| RefDocument {
+                id: d.id,
+                title: d.title.clone(),
+                source: d.source.clone(),
+                content: d.content.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -943,6 +1221,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             query_openrouter,
             rag_search,
+            get_reference_data,
             save_history,
             get_history,
             clear_old_history,
@@ -1009,6 +1288,15 @@ mod tests {
         let store = load_rag();
         let cards = retrieve(&store, "коксоартроз; инфаркт головного мозга", 8);
         assert!(cards.len() >= 2, "ожидалось ≥2 карточки, получено {}", cards.len());
+    }
+
+    #[test]
+    fn reference_data_loaded() {
+        let store = load_rag();
+        assert!(!store.procedures.is_empty(), "процедуры не загружены");
+        assert!(!store.contra_full.is_empty(), "противопоказания не загружены");
+        assert!(!store.proc_icf.is_empty(), "МКФ-таблицы не загружены");
+        assert!(!store.documents.is_empty(), "документы не загружены");
     }
 
     /// Golden-тест: точный RAG-контекст для фиксированного запроса.
